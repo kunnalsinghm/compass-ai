@@ -1,0 +1,44 @@
+# Two ways to run this - see README "Deployment" for the full walkthrough.
+#
+#   docker compose up --build
+#     -> Compass only, reading Guard's SQLite file via a READ-ONLY bind
+#        mount of Guard's actual data directory on the host. Set
+#        GUARD_DATA_HOST_PATH in .env to wherever Guard's data/ folder
+#        lives (e.g. ../finops-mvp/data), and GUARD_BASE_URL to wherever
+#        Guard itself is reachable (its own container, or the host).
+#
+#   docker compose --profile postgres up --build
+#     -> Same Compass service, but pointed at Guard's Postgres deployment
+#        instead of a bind-mounted SQLite file - no shared filesystem
+#        needed. Set GUARD_POSTGRES_URL in .env to Guard's own Postgres
+#        connection string. Compass's OWN data still defaults to SQLite
+#        unless you also set COMPASS_DB_DRIVER=postgres and give it its
+#        own COMPASS_POSTGRES_URL (a separate database/schema from
+#        Guard's - see server/storage/, never shared with guardDb.js).
+
+services:
+  compass:
+    build: .
+    ports:
+      - "4100:4100"
+    environment:
+      COMPASS_HOST: "0.0.0.0"
+      GUARD_BASE_URL: "${GUARD_BASE_URL:-http://host.docker.internal:4000}"
+      GUARD_DB_DRIVER: "${GUARD_DB_DRIVER:-sqlite}"
+      GUARD_DB_PATH: "/guard-data/finops.db"
+      GUARD_POSTGRES_URL: "${GUARD_POSTGRES_URL:-}"
+      GUARD_POSTGRES_SCHEMA: "${GUARD_POSTGRES_SCHEMA:-}"
+      COMPASS_DB_DRIVER: "${COMPASS_DB_DRIVER:-sqlite}"
+      COMPASS_POSTGRES_URL: "${COMPASS_POSTGRES_URL:-}"
+      COMPASS_JUDGE_API_KEY: "${COMPASS_JUDGE_API_KEY:-}"
+      COMPASS_EMBEDDING_API_KEY: "${COMPASS_EMBEDDING_API_KEY:-}"
+    volumes:
+      - compass-data:/app/data
+      - compass-logs:/app/logs
+      # Read-only: Compass must never be able to write into Guard's data
+      # directory, even by accident - see server/guardDb.js's header.
+      - "${GUARD_DATA_HOST_PATH:-../finops-mvp/data}:/guard-data:ro"
+
+volumes:
+  compass-data:
+  compass-logs:

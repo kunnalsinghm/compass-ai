@@ -1,0 +1,24 @@
+{
+  "name": "compass-ai",
+  "version": "0.1.0",
+  "description": "FinOps Trinity - Product 2: Compass AI. Cost reduction via caching, interpretable routing, and quality-verified optimization, sitting in front of a FinOps Guard deployment.",
+  "main": "server/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server/index.js",
+    "serve": "node scripts/supervisor.js",
+    "dev": "node --watch server/index.js",
+    "seed": "node server/seed.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "chart.js": "^4.4.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "helmet": "^8.3.0",
+    "pg": "^8.23.0"
+  },
+  "license": "MIT",
+  "author": "Compass AI (FinOps Trinity - Product 2)"
+}
