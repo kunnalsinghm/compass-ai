@@ -4,18 +4,19 @@
 // server/audit.js, own table (Compass's storage, not Guard's).
 
 const db = require("./storage");
+const { tenantKey } = require("./tenantContext");
 
 async function logAudit(actor, action, target, details = {}) {
   await db.run(
-    "INSERT INTO audit_log (actor, action, target, details, created_at) VALUES (?, ?, ?, ?, ?)",
-    [actor, action, target || null, JSON.stringify(details), new Date().toISOString()]
+    "INSERT INTO audit_log (tenant_key, actor, action, target, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    [tenantKey(), actor, action, target || null, JSON.stringify(details), new Date().toISOString()]
   );
 }
 
 async function getAuditLog({ limit = 100, action, actor } = {}) {
   let query = "SELECT * FROM audit_log";
-  const conditions = [];
-  const params = [];
+  const conditions = ["tenant_key = ?"];
+  const params = [tenantKey()];
   if (action) {
     conditions.push("action = ?");
     params.push(action);

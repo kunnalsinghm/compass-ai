@@ -5,6 +5,7 @@
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS cache_entries (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   cache_key TEXT NOT NULL UNIQUE,
   provider TEXT NOT NULL,
   model TEXT NOT NULL,
@@ -23,6 +24,7 @@ CREATE INDEX IF NOT EXISTS idx_cache_scope ON cache_entries(provider, model);
 
 CREATE TABLE IF NOT EXISTS semantic_cache_entries (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   provider TEXT NOT NULL,
   model TEXT NOT NULL,
   team TEXT,
@@ -45,8 +47,9 @@ CREATE INDEX IF NOT EXISTS idx_semantic_expires ON semantic_cache_entries(expire
 
 CREATE TABLE IF NOT EXISTS routing_policies (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   scope_type TEXT NOT NULL DEFAULT 'global',
-  scope_value TEXT,
+  scope_value TEXT NOT NULL DEFAULT '',        -- '' = whole tenant (NULL would defeat the unique index)
   provider TEXT NOT NULL,
   from_model TEXT NOT NULL,
   to_model TEXT NOT NULL,
@@ -54,12 +57,13 @@ CREATE TABLE IF NOT EXISTS routing_policies (
   status TEXT NOT NULL DEFAULT 'shadow',
   recommendation_id INTEGER,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE(scope_type, scope_value, provider, from_model)
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_routing_policy ON routing_policies(tenant_key, scope_type, scope_value, provider, from_model);
 
 CREATE TABLE IF NOT EXISTS routing_decisions_log (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   provider TEXT NOT NULL,
   requested_model TEXT NOT NULL,
@@ -75,6 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_routing_log_time ON routing_decisions_log(created
 
 CREATE TABLE IF NOT EXISTS evaluation_cases (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   source TEXT NOT NULL,
   provider TEXT NOT NULL,
@@ -82,11 +87,16 @@ CREATE TABLE IF NOT EXISTS evaluation_cases (
   candidate_model TEXT NOT NULL,
   input_json TEXT NOT NULL,
   rubric TEXT,
-  team TEXT
+  team TEXT,
+  baseline_response TEXT,           -- the answer the current model gave (replay compares against it)
+  trigger_source TEXT,             -- why this became a permanent case (thumbs_down, high_retry_count, ...)
+  guard_flag_id INTEGER            -- Guard flagged_test_cases.id this was imported from (dedupe key)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_evalcase_guard ON evaluation_cases(tenant_key, guard_flag_id);
 
 CREATE TABLE IF NOT EXISTS evaluation_results (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   case_id INTEGER,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   provider TEXT NOT NULL,
@@ -111,6 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_eval_time ON evaluation_results(created_at);
 
 CREATE TABLE IF NOT EXISTS recommendations (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   provider TEXT NOT NULL,
@@ -125,12 +136,13 @@ CREATE TABLE IF NOT EXISTS recommendations (
   confidence TEXT NOT NULL,
   caveat TEXT,
   evidence_json TEXT,
-  status TEXT NOT NULL DEFAULT 'pending',
-  UNIQUE(provider, current_model, suggested_model)
+  status TEXT NOT NULL DEFAULT 'pending'
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_recommendation ON recommendations(tenant_key, provider, current_model, suggested_model);
 
 CREATE TABLE IF NOT EXISTS approvals (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   recommendation_id INTEGER NOT NULL,
   action TEXT NOT NULL,
   actor TEXT NOT NULL,
@@ -142,6 +154,7 @@ CREATE INDEX IF NOT EXISTS idx_approvals_rec ON approvals(recommendation_id);
 
 CREATE TABLE IF NOT EXISTS savings_ledger (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   kind TEXT NOT NULL,
   provider TEXT,
@@ -158,12 +171,24 @@ CREATE INDEX IF NOT EXISTS idx_savings_kind ON savings_ledger(kind);
 
 CREATE TABLE IF NOT EXISTS audit_log (
   id SERIAL PRIMARY KEY,
+  tenant_key TEXT NOT NULL DEFAULT '',  -- '' = single-tenant; else Guard's tenant id
   actor TEXT NOT NULL,
   action TEXT NOT NULL,
   target TEXT,
   details TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_cache_tenant ON cache_entries(tenant_key);
+CREATE INDEX IF NOT EXISTS idx_semantic_tenant ON semantic_cache_entries(tenant_key);
+CREATE INDEX IF NOT EXISTS idx_policy_tenant ON routing_policies(tenant_key);
+CREATE INDEX IF NOT EXISTS idx_routing_log_tenant ON routing_decisions_log(tenant_key);
+CREATE INDEX IF NOT EXISTS idx_evalcase_tenant ON evaluation_cases(tenant_key);
+CREATE INDEX IF NOT EXISTS idx_evalresult_tenant ON evaluation_results(tenant_key, provider, primary_model, candidate_model);
+CREATE INDEX IF NOT EXISTS idx_rec_tenant ON recommendations(tenant_key);
+CREATE INDEX IF NOT EXISTS idx_approvals_tenant ON approvals(tenant_key);
+CREATE INDEX IF NOT EXISTS idx_savings_tenant ON savings_ledger(tenant_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_log(tenant_key);
 `;
 
 module.exports = { SCHEMA_SQL };

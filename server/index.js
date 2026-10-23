@@ -15,8 +15,6 @@ const path = require("path");
 
 const logger = require("./logger");
 const guardDb = require("./guardDb");
-const recommend = require("./recommend");
-const rollout = require("./rollout");
 
 const PORT = Number(process.env.PORT) || 4100;
 const HOST = process.env.COMPASS_HOST || "0.0.0.0";
@@ -46,9 +44,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal error" });
 });
 
-const REFRESH_MINUTES = Number(process.env.COMPASS_RECOMMENDATION_REFRESH_MINUTES) || 60;
-const AUTOCHECK_MINUTES = Number(process.env.COMPASS_AUTO_ROLLBACK_CHECK_MINUTES) || 15;
-
 async function start() {
   try {
     await guardDb.ready;
@@ -63,16 +58,7 @@ async function start() {
     logger.info(`Proxy endpoint: http://localhost:${PORT}/api/proxy/:provider (point your SDK's baseURL here)`);
   });
 
-  if (REFRESH_MINUTES > 0) {
-    setInterval(() => {
-      recommend.generateRecommendations({ days: 30 }).catch((err) => logger.error("Scheduled recommendation refresh failed", { error: err.message }));
-    }, REFRESH_MINUTES * 60 * 1000).unref();
-  }
-  if (AUTOCHECK_MINUTES > 0) {
-    setInterval(() => {
-      rollout.checkAutoRollbackConditions().catch((err) => logger.error("Scheduled auto-rollback check failed", { error: err.message }));
-    }, AUTOCHECK_MINUTES * 60 * 1000).unref();
-  }
+  require("./jobs").startSchedules();
 }
 
 start();

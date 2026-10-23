@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const { requireAuth } = require("../auth");
-const { getSavingsSummary, getTieredEconomicsReport } = require("../savings");
+const { getSavingsSummary, getTieredEconomicsReport, getVerifiedSavings } = require("../savings");
 
 router.get("/summary", requireAuth("read"), async (req, res) => {
   const days = Number(req.query.days) || 30;
@@ -13,6 +13,13 @@ router.get("/summary", requireAuth("read"), async (req, res) => {
 router.get("/tiered-economics", requireAuth("read"), async (req, res) => {
   const days = Number(req.query.days) || 30;
   res.json(await getTieredEconomicsReport({ days }));
+});
+
+// Realized, overhead-adjusted savings and the fee they support. Read-only.
+router.get("/verified", requireAuth("read"), async (req, res) => {
+  const days = Number(req.query.days) || 30;
+  const sharePct = req.query.share_pct !== undefined ? Number(req.query.share_pct) : undefined;
+  res.json(await getVerifiedSavings({ days, sharePct }));
 });
 
 module.exports = router;

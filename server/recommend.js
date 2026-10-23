@@ -25,7 +25,8 @@ const db = require("./storage");
 const guardDb = require("./guardDb");
 const pricing = require("./pricing");
 const evaluation = require("./evaluation");
-const { CHEAPER_ALTERNATIVES } = require("./modelTiers");
+const { cheaperAlternative } = require("./modelTiers");
+const { tenantKey } = require("./tenantContext");
 
 const MIN_TRAFFIC_EVENTS = Number(process.env.COMPASS_MIN_TRAFFIC_EVENTS) || 20;
 const MIN_SAMPLES_FOR_CONFIDENCE = Number(process.env.COMPASS_MIN_EVAL_SAMPLES) || 5;
@@ -97,8 +98,8 @@ async function generateRecommendations({ days = 30 } = {}) {
   const created = [];
 
   for (const row of spend) {
-    const key = `${row.provider}/${row.model}`;
-    const alt = CHEAPER_ALTERNATIVES[key];
+    // Family-aware and tolerant of dated ids ("gpt-4o-2024-08-06" -> gpt-4o-mini).
+    const alt = cheaperAlternative(row.provider, row.model);
     if (!alt) continue;
 
     const affectedEvents = Number(row.event_count) || 0;
@@ -131,10 +132,10 @@ async function generateRecommendations({ days = 30 } = {}) {
 
     await db.run(
       `INSERT INTO recommendations
-         (provider, current_model, suggested_model, window_days, current_cost_usd, estimated_suggested_cost_usd,
+         (tenant_key, provider, current_model, suggested_model, window_days, current_cost_usd, estimated_suggested_cost_usd,
           estimated_savings_usd, estimated_savings_pct, affected_events, confidence, caveat, evidence_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(provider, current_model, suggested_model) DO UPDATE SET
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tenant_key, provider, current_model, suggested_model) DO UPDATE SET
          window_days = excluded.window_days,
          current_cost_usd = excluded.current_cost_usd,
          estimated_suggested_cost_usd = excluded.estimated_suggested_cost_usd,
@@ -145,7 +146,7 @@ async function generateRecommendations({ days = 30 } = {}) {
          caveat = excluded.caveat,
          evidence_json = excluded.evidence_json,
          updated_at = ${db.dialect === "postgres" ? "NOW()" : "datetime('now')"}`,
-      [row.provider, row.model, alt.model, days, currentCost, estimatedSuggestedCost, estimatedSavings, estimatedSavingsPct, affectedEvents, confidence, caveat, JSON.stringify(evidence)]
+      [tenantKey(), row.provider, row.model, alt.model, days, currentCost, estimatedSuggestedCost, estimatedSavings, estimatedSavingsPct, affectedEvents, confidence, caveat, JSON.stringify(evidence)]
     );
 
     // Ensure a shadow-only routing policy exists the moment a
@@ -153,10 +154,10 @@ async function generateRecommendations({ days = 30 } = {}) {
     // starting at "0% -> shadow only." Never created at nonzero rollout -
     // only an explicit approval (rollout.js) advances it.
     await db.run(
-      `INSERT INTO routing_policies (scope_type, scope_value, provider, from_model, to_model, rollout_pct, status)
-       VALUES ('global', NULL, ?, ?, ?, 0, 'shadow')
-       ON CONFLICT(scope_type, scope_value, provider, from_model) DO NOTHING`,
-      [row.provider, row.model, alt.model]
+      `INSERT INTO routing_policies (tenant_key, scope_type, scope_value, provider, from_model, to_model, rollout_pct, status)
+       VALUES (?, 'global', '', ?, ?, ?, 0, 'shadow')
+       ON CONFLICT(tenant_key, scope_type, scope_value, provider, from_model) DO NOTHING`,
+      [tenantKey(), row.provider, row.model, alt.model]
     );
 
     created.push({ provider: row.provider, current_model: row.model, suggested_model: alt.model, confidence });
@@ -167,12 +168,12 @@ async function generateRecommendations({ days = 30 } = {}) {
 
 async function listRecommendations({ status } = {}) {
   const recs = status
-    ? await db.all(`SELECT * FROM recommendations WHERE status = ? ORDER BY estimated_savings_usd DESC NULLS LAST`, [status])
-    : await db.all(`SELECT * FROM recommendations ORDER BY estimated_savings_usd DESC`);
+    ? await db.all(`SELECT * FROM recommendations WHERE tenant_key = ? AND status = ? ORDER BY estimated_savings_usd DESC NULLS LAST`, [tenantKey(), status])
+    : await db.all(`SELECT * FROM recommendations WHERE tenant_key = ? ORDER BY estimated_savings_usd DESC NULLS LAST`, [tenantKey()]);
 
   const enriched = [];
   for (const rec of recs) {
-    const policy = await db.get(`SELECT * FROM routing_policies WHERE provider = ? AND from_model = ?`, [rec.provider, rec.current_model]);
+    const policy = await db.get(`SELECT * FROM routing_policies WHERE tenant_key = ? AND provider = ? AND from_model = ?`, [tenantKey(), rec.provider, rec.current_model]);
     enriched.push({
       ...rec,
       evidence: rec.evidence_json ? JSON.parse(rec.evidence_json) : null,
@@ -185,9 +186,9 @@ async function listRecommendations({ status } = {}) {
 }
 
 async function getRecommendation(id) {
-  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ?`, [id]);
+  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ? AND tenant_key = ?`, [id, tenantKey()]);
   if (!rec) return null;
-  const policy = await db.get(`SELECT * FROM routing_policies WHERE provider = ? AND from_model = ?`, [rec.provider, rec.current_model]);
+  const policy = await db.get(`SELECT * FROM routing_policies WHERE tenant_key = ? AND provider = ? AND from_model = ?`, [tenantKey(), rec.provider, rec.current_model]);
   return {
     ...rec,
     evidence: rec.evidence_json ? JSON.parse(rec.evidence_json) : null,

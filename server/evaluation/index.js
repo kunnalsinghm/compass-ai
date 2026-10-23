@@ -7,6 +7,7 @@
 // separately via recordHumanLabel, against an existing result row.
 
 const db = require("../storage");
+const { tenantKey } = require("../tenantContext");
 const { runDeterministicChecks, extractText } = require("./deterministic");
 const { judgeResponses } = require("./llmJudge");
 const { tokenize, termFrequency, cosineSimilarityLocal } = require("../semanticCache");
@@ -15,13 +16,29 @@ function lexicalSimilarity(textA, textB) {
   return cosineSimilarityLocal(termFrequency(tokenize(textA)), termFrequency(tokenize(textB)));
 }
 
-async function createEvaluationCase({ source, provider, primaryModel, candidateModel, inputJson, rubric, team }) {
+async function createEvaluationCase({ source, provider, primaryModel, candidateModel, inputJson, rubric, team, baselineResponse = null, triggerSource = null, guardFlagId = null }) {
   const result = await db.run(
-    `INSERT INTO evaluation_cases (source, provider, primary_model, candidate_model, input_json, rubric, team)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [source, provider, primaryModel, candidateModel, JSON.stringify(inputJson), rubric ? JSON.stringify(rubric) : null, team || null]
+    `INSERT INTO evaluation_cases (tenant_key, source, provider, primary_model, candidate_model, input_json, rubric, team, baseline_response, trigger_source, guard_flag_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+    [tenantKey(), source, provider, primaryModel, candidateModel, JSON.stringify(inputJson), rubric ? JSON.stringify(rubric) : null, team || null, baselineResponse, triggerSource, guardFlagId]
   );
   return result.lastInsertRowid;
+}
+
+async function getEvaluationCase(id) {
+  return db.get(`SELECT * FROM evaluation_cases WHERE id = ? AND tenant_key = ?`, [id, tenantKey()]);
+}
+
+async function listEvaluationCases({ limit = 100 } = {}) {
+  return db.all(`SELECT id, created_at, source, provider, primary_model, candidate_model, team, trigger_source, guard_flag_id,
+                        (baseline_response IS NOT NULL) AS has_baseline
+                 FROM evaluation_cases WHERE tenant_key = ? ORDER BY id DESC LIMIT ?`, [tenantKey(), Math.min(500, Number(limit) || 100)]);
+}
+
+// Highest Guard flagged_test_cases id already imported for this tenant.
+async function lastImportedGuardFlagId() {
+  const row = await db.get(`SELECT COALESCE(MAX(guard_flag_id), 0) AS id FROM evaluation_cases WHERE tenant_key = ?`, [tenantKey()]);
+  return Number(row?.id || 0);
 }
 
 // The main entry point: given a primary (current) response and a
@@ -60,11 +77,12 @@ async function runEvaluation({
 
   const result = await db.run(
     `INSERT INTO evaluation_results
-       (case_id, provider, primary_model, candidate_model, team, primary_cost_usd, candidate_cost_usd,
+       (tenant_key, case_id, provider, primary_model, candidate_model, team, primary_cost_usd, candidate_cost_usd,
         deterministic_pass, deterministic_details, judge_score, judge_rationale, judge_model,
         lexical_similarity, primary_length, candidate_length, error)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      tenantKey(),
       caseId || null,
       provider,
       primaryModel,
@@ -97,7 +115,8 @@ async function recordHumanLabel(resultId, label) {
   if (!validLabels.includes(label)) {
     throw new Error(`Invalid human label '${label}'. Must be one of: ${validLabels.join(", ")}`);
   }
-  await db.run(`UPDATE evaluation_results SET human_label = ? WHERE id = ?`, [label, resultId]);
+  const result = await db.run(`UPDATE evaluation_results SET human_label = ? WHERE id = ? AND tenant_key = ?`, [label, resultId, tenantKey()]);
+  if (!result.changes) throw new Error(`Evaluation result ${resultId} not found`);
 }
 
 // Aggregated evidence for one (provider, primary, candidate) pair - this
@@ -106,8 +125,8 @@ async function recordHumanLabel(resultId, label) {
 // blueprint's confidence-state thresholds on top of this.
 async function getEvaluationStatsForPair(provider, primaryModel, candidateModel) {
   const results = await db.all(
-    `SELECT * FROM evaluation_results WHERE provider = ? AND primary_model = ? AND candidate_model = ? ORDER BY id DESC LIMIT 500`,
-    [provider, primaryModel, candidateModel]
+    `SELECT * FROM evaluation_results WHERE tenant_key = ? AND provider = ? AND primary_model = ? AND candidate_model = ? ORDER BY id DESC LIMIT 500`,
+    [tenantKey(), provider, primaryModel, candidateModel]
   );
 
   if (results.length === 0) {
@@ -139,4 +158,4 @@ function round3(n) {
   return Math.round((Number(n) || 0) * 1000) / 1000;
 }
 
-module.exports = { createEvaluationCase, runEvaluation, recordHumanLabel, getEvaluationStatsForPair, lexicalSimilarity };
+module.exports = { getEvaluationCase, listEvaluationCases, lastImportedGuardFlagId, createEvaluationCase, runEvaluation, recordHumanLabel, getEvaluationStatsForPair, lexicalSimilarity };

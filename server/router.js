@@ -27,9 +27,11 @@
 // - used only when the primary provider call itself fails, not as a
 // cost-routing decision.
 
-const { CHEAPER_ALTERNATIVES, TIER_LADDER, tierForModel, modelForTier } = require("./modelTiers");
+const { ladderFor } = require("./modelTiers");
 const guardDb = require("./guardDb");
+const guardPolicy = require("./guardPolicy");
 const db = require("./storage");
+const { tenantKey } = require("./tenantContext");
 
 const SAFETY_KEYWORDS = ["medical diagnosis", "legal advice", "suicide", "self-harm", "prescription dosage"];
 
@@ -102,24 +104,17 @@ function dialAllowsDowngrade(dial, classification) {
 
 async function findApprovedPolicy(provider, model) {
   return db.get(
-    `SELECT * FROM routing_policies WHERE provider = ? AND from_model = ? AND status NOT IN ('rejected','rolled_back') AND rollout_pct > 0`,
-    [provider, model]
+    `SELECT * FROM routing_policies WHERE tenant_key = ? AND provider = ? AND from_model = ? AND status NOT IN ('rejected','rolled_back') AND rollout_pct > 0`,
+    [tenantKey(), provider, model]
   );
 }
 
+// Same rule Guard enforces (see guardPolicy.js): the key's own list wins if it
+// has one, else the team's, else unrestricted. Checking a different rule here
+// than Guard applies would make Compass refuse routes Guard would allow (or
+// propose ones Guard would then block).
 async function isModelAllowed(provider, model, team, apiKeyId) {
-  const scopes = [
-    ["team", team],
-    ["key", apiKeyId],
-  ].filter(([, value]) => value);
-  if (!scopes.length) return true; // no scope info to check against - don't block
-  for (const [scopeType, scopeValue] of scopes) {
-    const rows = await guardDb.getModelAllowlist(scopeType, scopeValue);
-    if (rows.length === 0) continue; // no allowlist configured for this scope = unrestricted
-    const allowed = rows.some((r) => r.provider === provider && r.model === model);
-    if (!allowed) return false;
-  }
-  return true;
+  return (await guardPolicy.checkModelAllowed({ keyId: apiKeyId, team, provider, model })).allowed;
 }
 
 async function checkBudgetPressure(team) {
@@ -134,8 +129,8 @@ async function checkBudgetPressure(team) {
     const tightestLimit = Math.min(...budgets.map((b) => Number(b.monthly_limit_usd)).filter((n) => Number.isFinite(n) && n > 0));
     if (!Number.isFinite(tightestLimit) || tightestLimit <= 0) return false;
 
-    const spend = await guardDb.getSpendByModelAndTeam({ days: 30 });
-    const teamSpend = spend.filter((r) => r.team === team).reduce((sum, r) => sum + (Number(r.total_cost) || 0), 0);
+    // Calendar month, because that is what Guard's budget limit is measured against.
+    const teamSpend = await guardDb.getTeamMonthSpend(team);
     return teamSpend / tightestLimit >= 0.8;
   } catch {
     return false; // budgets table shape can vary - never let this block a request
@@ -145,9 +140,9 @@ async function checkBudgetPressure(team) {
 async function logDecision({ provider, requestedModel, effectiveModel, classification, dial, policyId, reasons, team, customerId }) {
   await db.run(
     `INSERT INTO routing_decisions_log
-       (provider, requested_model, effective_model, classification, cost_quality_dial, policy_id, reasons_json, team, customer_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [provider, requestedModel, effectiveModel, classification, dial ?? null, policyId || null, JSON.stringify(reasons), team || null, customerId || null]
+       (tenant_key, provider, requested_model, effective_model, classification, cost_quality_dial, policy_id, reasons_json, team, customer_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [tenantKey(), provider, requestedModel, effectiveModel, classification, dial ?? null, policyId || null, JSON.stringify(reasons), team || null, customerId || null]
   );
 }
 
@@ -196,12 +191,17 @@ async function decideRoute({ provider, requestedModel, body, team, customerId, a
 
   let effectiveModel = requestedModel;
   if (dialAllowsDowngrade(effectiveDial, classification)) {
-    const currentTier = tierForModel(provider, requestedModel);
-    const ladder = TIER_LADDER[provider] || [];
-    const currentIndex = ladder.findIndex((e) => e.tier === currentTier);
+    // Ladders are per model family (modelTiers.js). A model on no ladder - a
+    // new release, a fine-tune - is left alone: unknown must never be read as
+    // "downgrade to the cheapest rung".
+    const found = ladderFor(provider, requestedModel);
+    if (!found) {
+      reasons.push(`'${requestedModel}' is not on a known tier ladder - Compass only re-routes models it can place, keeping it as requested`);
+    }
+    const ladder = found?.ladder || [];
     // Downgrade by one tier at dial 3-7, straight to cheapest at 8-10.
-    const targetEntry = effectiveDial >= 8 ? ladder[0] : ladder[Math.max(0, currentIndex - 1)];
-    if (targetEntry && targetEntry.model !== requestedModel) {
+    const targetEntry = !found || found.index === 0 ? null : effectiveDial >= 8 ? ladder[0] : ladder[found.index - 1];
+    if (targetEntry) {
       const allowed = await isModelAllowed(provider, targetEntry.model, team, apiKeyId);
       if (allowed) {
         effectiveModel = targetEntry.model;
@@ -233,7 +233,7 @@ function resolveFallbackProvider(provider) {
 }
 
 async function getRecentDecisions({ limit = 50 } = {}) {
-  return db.all(`SELECT * FROM routing_decisions_log ORDER BY id DESC LIMIT ?`, [limit]);
+  return db.all(`SELECT * FROM routing_decisions_log WHERE tenant_key = ? ORDER BY id DESC LIMIT ?`, [tenantKey(), limit]);
 }
 
 module.exports = {

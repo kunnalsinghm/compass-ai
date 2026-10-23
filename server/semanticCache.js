@@ -31,6 +31,7 @@
 const crypto = require("crypto");
 const db = require("./storage");
 const { recordSaving } = require("./savings");
+const { tenantKey } = require("./tenantContext");
 
 const MODE = (process.env.COMPASS_SEMANTIC_CACHE_MODE || "local").toLowerCase();
 const THRESHOLD = Number(process.env.COMPASS_SEMANTIC_CACHE_THRESHOLD) || (MODE === "embedding" ? 0.9 : 0.92);
@@ -163,12 +164,13 @@ async function findSemanticMatch({ provider, model, team, customerId, body, thre
 
     const candidates = await db.all(
       `SELECT * FROM semantic_cache_entries
-       WHERE provider = ? AND model = ? AND vector_type = ?
+       WHERE tenant_key = ? AND provider = ? AND model = ? AND vector_type = ?
          AND system_fingerprint = ? AND tools_fingerprint = ?
          AND (team IS ? OR team = ?)
          AND (customer_id IS ? OR customer_id = ?)
          AND expires_at > ?`,
       [
+        tenantKey(),
         provider,
         model,
         vectorType,
@@ -194,7 +196,7 @@ async function findSemanticMatch({ provider, model, team, customerId, body, thre
 
     if (!best) return null;
 
-    await db.run("UPDATE semantic_cache_entries SET hit_count = hit_count + 1 WHERE id = ?", [best.entry.id]);
+    await db.run("UPDATE semantic_cache_entries SET hit_count = hit_count + 1 WHERE id = ? AND tenant_key = ?", [best.entry.id, tenantKey()]);
     await recordSaving({
       kind: "semantic_cache_hit",
       provider,
@@ -210,6 +212,7 @@ async function findSemanticMatch({ provider, model, team, customerId, body, thre
       responseJson: JSON.parse(best.entry.response_json),
       input_tokens: best.entry.input_tokens,
       output_tokens: best.entry.output_tokens,
+      costPerHitUsd: best.entry.cost_per_hit_usd,
       similarity: Math.round(best.similarity * 1000) / 1000,
     };
   } catch (err) {
@@ -230,10 +233,11 @@ async function setSemanticCache({ provider, model, team, customerId, body, respo
 
     await db.run(
       `INSERT INTO semantic_cache_entries
-         (provider, model, team, customer_id, system_fingerprint, tools_fingerprint, prompt_text, vector_type, vector_json,
+         (tenant_key, provider, model, team, customer_id, system_fingerprint, tools_fingerprint, prompt_text, vector_type, vector_json,
           response_json, input_tokens, output_tokens, cost_per_hit_usd, hit_count, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
       [
+        tenantKey(),
         provider,
         model,
         team || null,
@@ -256,9 +260,13 @@ async function setSemanticCache({ provider, model, team, customerId, body, respo
 }
 
 async function getSemanticCacheStats() {
-  const totals = await db.get(`SELECT COUNT(*) AS entries, COALESCE(SUM(hit_count),0) AS total_hits FROM semantic_cache_entries`);
+  const totals = await db.get(
+    `SELECT COUNT(*) AS entries, COALESCE(SUM(hit_count),0) AS total_hits FROM semantic_cache_entries WHERE tenant_key = ?`,
+    [tenantKey()]
+  );
   const savings = await db.get(
-    `SELECT COALESCE(SUM(net_savings_usd),0) AS net_savings_usd FROM savings_ledger WHERE kind = 'semantic_cache_hit'`
+    `SELECT COALESCE(SUM(net_savings_usd),0) AS net_savings_usd FROM savings_ledger WHERE kind = 'semantic_cache_hit' AND tenant_key = ?`,
+    [tenantKey()]
   );
   return {
     mode: MODE,
@@ -270,7 +278,7 @@ async function getSemanticCacheStats() {
 }
 
 async function clearSemanticCache() {
-  await db.run("DELETE FROM semantic_cache_entries");
+  await db.run("DELETE FROM semantic_cache_entries WHERE tenant_key = ?", [tenantKey()]);
 }
 
 module.exports = {
@@ -279,6 +287,7 @@ module.exports = {
   getSemanticCacheStats,
   clearSemanticCache,
   extractPromptText,
+  isExcluded,
   fingerprintSystem,
   fingerprintTools,
   tokenize,

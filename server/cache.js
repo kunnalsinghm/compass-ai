@@ -18,19 +18,21 @@
 const crypto = require("crypto");
 const db = require("./storage");
 const { recordSaving } = require("./savings");
+const { tenantKey } = require("./tenantContext");
 
 const DEFAULT_TTL_SECONDS = Number(process.env.COMPASS_CACHE_TTL_SECONDS) || 300;
 
 function makeCacheKey({ provider, model, body, team, customerId }) {
   const { stream, stream_options, ...cacheable } = body || {};
-  const normalized = JSON.stringify({ provider, model, team: team || null, customerId: customerId || null, ...cacheable });
+  // tenant first: two tenants sending byte-identical requests must never share an entry.
+  const normalized = JSON.stringify({ tenant: tenantKey(), provider, model, team: team || null, customerId: customerId || null, ...cacheable });
   return crypto.createHash("sha256").update(normalized).digest("hex");
 }
 
 // Returns the cached response (and records the savings ledger entry) on a
 // hit, or null on a miss/expiry. Fire-and-forget-safe: never throws.
 async function getCached(cacheKey) {
-  const row = await db.get("SELECT * FROM cache_entries WHERE cache_key = ?", [cacheKey]);
+  const row = await db.get("SELECT * FROM cache_entries WHERE cache_key = ? AND tenant_key = ?", [cacheKey, tenantKey()]);
   if (!row) return null;
   if (new Date(row.expires_at).getTime() <= Date.now()) {
     await db.run("DELETE FROM cache_entries WHERE id = ?", [row.id]);
@@ -54,6 +56,7 @@ async function getCached(cacheKey) {
     responseJson: JSON.parse(row.response_json),
     input_tokens: row.input_tokens,
     output_tokens: row.output_tokens,
+    costPerHitUsd: row.cost_per_hit_usd,
   };
 }
 
@@ -61,25 +64,27 @@ async function setCached({ cacheKey, provider, model, team, customerId, response
   const expiresAt = new Date(Date.now() + (ttlSeconds || DEFAULT_TTL_SECONDS) * 1000).toISOString();
   await db.run(
     `INSERT INTO cache_entries
-       (cache_key, provider, model, team, customer_id, response_json, input_tokens, output_tokens, cost_per_hit_usd, hit_count, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+       (cache_key, tenant_key, provider, model, team, customer_id, response_json, input_tokens, output_tokens, cost_per_hit_usd, hit_count, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
      ON CONFLICT(cache_key) DO UPDATE SET
        response_json = excluded.response_json,
        input_tokens = excluded.input_tokens,
        output_tokens = excluded.output_tokens,
        cost_per_hit_usd = excluded.cost_per_hit_usd,
        expires_at = excluded.expires_at`,
-    [cacheKey, provider, model, team || null, customerId || null, JSON.stringify(responseJson), input_tokens || 0, output_tokens || 0, costUsd || 0, expiresAt]
+    [cacheKey, tenantKey(), provider, model, team || null, customerId || null, JSON.stringify(responseJson), input_tokens || 0, output_tokens || 0, costUsd || 0, expiresAt]
   );
 }
 
 async function getCacheStats() {
   const totals = await db.get(
-    `SELECT COUNT(*) AS entries, COALESCE(SUM(hit_count), 0) AS total_hits FROM cache_entries`
+    `SELECT COUNT(*) AS entries, COALESCE(SUM(hit_count), 0) AS total_hits FROM cache_entries WHERE tenant_key = ?`,
+    [tenantKey()]
   );
   const savings = await db.get(
     `SELECT COALESCE(SUM(net_savings_usd), 0) AS net_savings_usd, COUNT(*) AS hit_events
-     FROM savings_ledger WHERE kind = 'exact_cache_hit'`
+     FROM savings_ledger WHERE kind = 'exact_cache_hit' AND tenant_key = ?`,
+    [tenantKey()]
   );
   return {
     current_size: Number(totals?.entries || 0),
@@ -89,7 +94,7 @@ async function getCacheStats() {
 }
 
 async function clearCache() {
-  await db.run("DELETE FROM cache_entries");
+  await db.run("DELETE FROM cache_entries WHERE tenant_key = ?", [tenantKey()]);
 }
 
 module.exports = { makeCacheKey, getCached, setCached, getCacheStats, clearCache, DEFAULT_TTL_SECONDS };

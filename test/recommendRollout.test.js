@@ -1,4 +1,4 @@
-const test = require("node:test");
+const test = require("./helpers/tenantTest");
 const assert = require("node:assert/strict");
 const path = require("node:path");
 const fs = require("node:fs");
@@ -117,7 +117,12 @@ test("end-to-end: generate -> approve -> advance -> rollback", async () => {
   assert.equal(afterApproval.status, "approved");
   assert.equal(afterApproval.rollout_pct, 1);
 
-  await rollout.advanceRollout(rec.id, "test-actor", 50, { note: "looking good" });
+  // Evidence gate: no shadow samples yet, so going past the canary is refused...
+  await assert.rejects(() => rollout.advanceRollout(rec.id, "test-actor", 50, { note: "looking good" }), /evaluation sample/);
+  await assert.rejects(() => rollout.advanceRollout(rec.id, "test-actor", 50, { override: true }), /evaluation sample/); // override needs a note
+  await rollout.advanceRollout(rec.id, "test-actor", 5, { note: "still canary" }); // canary range is ungated
+  // ...unless a human explicitly overrides, which is recorded.
+  await rollout.advanceRollout(rec.id, "test-actor", 50, { note: "looking good", override: true });
   const afterAdvance = await recommend.getRecommendation(rec.id);
   assert.equal(afterAdvance.rollout_pct, 50);
   assert.equal(afterAdvance.rollout_label, "approved-for-production");

@@ -18,7 +18,7 @@
 
 const evaluation = require("./evaluation");
 const { runShadowTest } = require("./shadowTest");
-const { CHEAPER_ALTERNATIVES } = require("./modelTiers");
+const { cheaperAlternative } = require("./modelTiers");
 const logger = require("./logger");
 
 const VALID_TRIGGERS = [
@@ -52,12 +52,13 @@ async function reportProductionEvent({
   guardBaseUrl,
   guardApiKey,
   providerKey,
+  extraHeaders,
 }) {
   if (!VALID_TRIGGERS.includes(trigger)) {
     throw new Error(`Unknown trigger '${trigger}'. Must be one of: ${VALID_TRIGGERS.join(", ")}`);
   }
 
-  const alternative = CHEAPER_ALTERNATIVES[`${provider}/${model}`];
+  const alternative = cheaperAlternative(provider, model);
 
   const caseId = await evaluation.createEvaluationCase({
     source: "production_trigger",
@@ -88,6 +89,7 @@ async function reportProductionEvent({
       guardBaseUrl,
       guardApiKey,
       providerKey,
+      extraHeaders,
       rubric,
     }).catch((err) => logger.error("Trace-pipeline shadow test failed", { error: err.message }));
   }
@@ -95,4 +97,79 @@ async function reportProductionEvent({
   return { case_id: caseId, alternative_model: alternative?.model || null, shadow_test_queued: shadowTestQueued };
 }
 
-module.exports = { reportProductionEvent, VALID_TRIGGERS };
+// ---------------------------------------------------------------------
+// Automatic production signals from Guard. Guard already detects some of the
+// blueprint's triggers on its own (a shadow comparison with low similarity, an
+// agent in a retry storm) and stores the prompt/response pair in its
+// flagged_test_cases table "as cheap groundwork for Compass". This imports
+// them as permanent evaluation cases, once each (guard_flag_id is unique per
+// tenant), so the loop closes without the customer having to call
+// POST /api/feedback for everything Guard can see itself.
+//
+// An imported case has the prompt and the response the CURRENT model gave, but
+// no provider key (Compass never stores one) - so it is not shadow-tested here.
+// It waits as a case; POST /api/evaluation/cases/:id/replay runs it against its
+// cheaper candidate whenever someone supplies a key.
+// ---------------------------------------------------------------------
+const GUARD_SOURCE_TO_TRIGGER = {
+  "shadow-low-similarity": "quality_score_regression",
+  "high-retry-rate": "high_retry_count",
+  "thumbs-down": "thumbs_down",
+};
+
+async function syncFlaggedFromGuard({ limit = 200 } = {}) {
+  const guardDb = require("./guardDb");
+  const after = await evaluation.lastImportedGuardFlagId();
+  const rows = await guardDb.getFlaggedTestCases({ afterId: after, limit });
+  let imported = 0;
+  for (const row of rows) {
+    if (!row.provider || !row.model || !row.prompt) continue; // nothing replayable
+    const alternative = cheaperAlternative(row.provider, row.model);
+    await evaluation.createEvaluationCase({
+      source: "production_trigger",
+      provider: row.provider,
+      primaryModel: row.model,
+      candidateModel: alternative?.model || row.model,
+      inputJson: { messages: [{ role: "user", content: row.prompt }] },
+      rubric: { type: "none", trigger: GUARD_SOURCE_TO_TRIGGER[row.source] || "manual", note: row.reason || null },
+      team: null,
+      baselineResponse: row.response || null,
+      triggerSource: GUARD_SOURCE_TO_TRIGGER[row.source] || "manual",
+      guardFlagId: row.id,
+    });
+    imported++;
+  }
+  // Rows we skipped still advance nothing, so they are re-read next time; that is
+  // cheap (the cursor is the highest imported id) and keeps the logic stateless.
+  return { scanned: rows.length, imported };
+}
+
+// Re-run a stored case against its candidate model. Needs the caller's headers
+// (key + provider key) because the candidate call goes through Guard as them.
+async function replayCase(caseRow, { guardBaseUrl, guardApiKey, providerKey, extraHeaders, team }) {
+  if (!caseRow.baseline_response) throw new Error("This case has no baseline response to compare against");
+  const input = JSON.parse(caseRow.input_json);
+  const text = caseRow.baseline_response;
+  const primaryResponseJson =
+    caseRow.provider === "anthropic"
+      ? { content: [{ type: "text", text }] }
+      : { choices: [{ message: { role: "assistant", content: text } }] };
+  const rubric = caseRow.rubric ? JSON.parse(caseRow.rubric) : null;
+  await runShadowTest({
+    provider: caseRow.provider,
+    primaryModel: caseRow.primary_model,
+    candidateModel: caseRow.candidate_model,
+    requestBody: input,
+    primaryResponseJson,
+    primaryCostUsd: null,
+    team: team || caseRow.team,
+    guardBaseUrl,
+    guardApiKey,
+    providerKey,
+    extraHeaders,
+    rubric,
+    existingCaseId: caseRow.id,
+  });
+}
+
+module.exports = { reportProductionEvent, syncFlaggedFromGuard, replayCase, VALID_TRIGGERS };

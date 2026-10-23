@@ -66,6 +66,12 @@ function setupGuardFixture(testName) {
       provider TEXT NOT NULL,
       model TEXT NOT NULL
     );
+    CREATE TABLE region_allowlist (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      scope_type TEXT NOT NULL,
+      scope_value TEXT NOT NULL,
+      region TEXT NOT NULL
+    );
     CREATE TABLE budgets (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       scope_type TEXT NOT NULL,
@@ -114,6 +120,9 @@ function setupGuardFixture(testName) {
         seedDb
           .prepare(`INSERT INTO model_allowlist (scope_type, scope_value, provider, model) VALUES (?, ?, ?, ?)`)
           .run(row.scope_type, row.scope_value, row.provider, row.model);
+      }
+      for (const row of rows.region_allowlist || []) {
+        seedDb.prepare(`INSERT INTO region_allowlist (scope_type, scope_value, region) VALUES (?, ?, ?)`).run(row.scope_type, row.scope_value, row.region);
       }
       for (const row of rows.budgets || []) {
         seedDb.prepare(`INSERT INTO budgets (scope_type, scope_value, monthly_limit_usd) VALUES (?, ?, ?)`).run(row.scope_type, row.scope_value, row.monthly_limit_usd);

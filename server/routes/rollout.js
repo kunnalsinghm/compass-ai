@@ -8,6 +8,7 @@ router.post("/:recommendationId/approve", requireAuth("manage_recommendations"),
     const policy = await rollout.approveRecommendation(Number(req.params.recommendationId), req.apiKey.key_id, {
       rolloutPct: req.body?.rollout_pct,
       note: req.body?.note,
+      override: req.body?.override === true,
     });
     res.json({ ok: true, policy });
   } catch (err) {
