@@ -151,7 +151,21 @@ function fakeResponse(provider, text) {
   return { choices: [{ message: { role: "assistant", content: text } }], usage: { prompt_tokens: 100, completion_tokens: 40 } };
 }
 
-main().catch((err) => {
+// Seeding writes Compass tables and reads Guard's, so it needs a tenant context
+// like any request. Single-tenant: the empty tenant. Multi-tenant: name one
+// with COMPASS_SEED_TENANT_ID (a demo seed must not pick a customer for you).
+async function seedInContext() {
+  const tenantContext = require("./tenantContext");
+  await guardDb.ready;
+  if (!guardDb.MULTI_TENANT) return tenantContext.runWithTenant({}, main);
+  const wanted = process.env.COMPASS_SEED_TENANT_ID;
+  const tenants = await guardDb.listActiveTenants();
+  const tenant = tenants.find((t) => String(t.id) === String(wanted));
+  if (!tenant) throw new Error(`Multi-tenant Guard: set COMPASS_SEED_TENANT_ID to one of: ${tenants.map((t) => t.id).join(", ") || "(no active tenants)"}`);
+  return tenantContext.runWithTenant({ tenantId: tenant.id, tenantSchema: tenant.schema_name }, main);
+}
+
+seedInContext().catch((err) => {
   console.error("Seed failed:", err);
   process.exit(1);
 });

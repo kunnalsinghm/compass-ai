@@ -18,7 +18,10 @@ const raw = new DatabaseSync(DB_PATH);
 raw.exec("PRAGMA journal_mode = WAL;");
 
 const { SCHEMA_SQL } = require("./schema.sqlite");
+const legacy = require("./legacyMigrate");
+legacy.preSqlite(raw); // databases created before tenant scoping (see legacyMigrate.js)
 raw.exec(SCHEMA_SQL);
+legacy.postSqlite(raw);
 
 const dialect = "sqlite";
 

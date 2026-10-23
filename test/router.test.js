@@ -1,4 +1,4 @@
-const test = require("node:test");
+const test = require("./helpers/tenantTest");
 const assert = require("node:assert/strict");
 const path = require("node:path");
 const fs = require("node:fs");
@@ -105,8 +105,8 @@ test("decideRoute: model allowlist blocks a downgrade outside the allowed set", 
 
 test("decideRoute: an approved 100% policy always wins over the dial", async () => {
   await db.run(
-    `INSERT INTO routing_policies (scope_type, scope_value, provider, from_model, to_model, rollout_pct, status, recommendation_id)
-     VALUES ('global', NULL, 'openai', 'gpt-4o', 'gpt-4o-mini', 100, 'full', 1)`
+    `INSERT INTO routing_policies (tenant_key, scope_type, scope_value, provider, from_model, to_model, rollout_pct, status, recommendation_id)
+     VALUES ('', 'global', '', 'openai', 'gpt-4o', 'gpt-4o-mini', 100, 'full', 1)`
   );
   const result = await router.decideRoute({
     provider: "openai",

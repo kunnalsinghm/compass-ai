@@ -19,8 +19,15 @@ const { logAudit } = require("./audit");
 const { computeConfidence } = require("./recommend");
 const evaluation = require("./evaluation");
 const logger = require("./logger");
+const { tenantKey } = require("./tenantContext");
 
 const ROLLOUT_LADDER = [0, 1, 5, 25, 50, 100];
+
+// Canary (<= CANARY_MAX_PCT) is how evidence gets gathered, so it is ungated.
+// Going wider needs real evidence: a handful of shadow samples is not enough to
+// put a cheaper model in front of production traffic (blueprint 3.9/3.10).
+const CANARY_MAX_PCT = 5;
+const MIN_SAMPLES_FOR_WIDE_ROLLOUT = Number(process.env.COMPASS_MIN_SAMPLES_FOR_WIDE_ROLLOUT) || 30;
 
 function statusForPct(pct) {
   if (pct <= 0) return "shadow";
@@ -31,24 +38,25 @@ function statusForPct(pct) {
 }
 
 async function getPolicyForRecommendation(rec) {
-  return db.get(`SELECT * FROM routing_policies WHERE provider = ? AND from_model = ?`, [rec.provider, rec.current_model]);
+  return db.get(`SELECT * FROM routing_policies WHERE tenant_key = ? AND provider = ? AND from_model = ?`, [tenantKey(), rec.provider, rec.current_model]);
 }
 
 async function approveRecommendation(recommendationId, actor, { rolloutPct = 1, note } = {}) {
   if (!ROLLOUT_LADDER.includes(rolloutPct)) {
     throw new Error(`rolloutPct must be one of ${ROLLOUT_LADDER.join(", ")}`);
   }
-  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ?`, [recommendationId]);
+  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ? AND tenant_key = ?`, [recommendationId, tenantKey()]);
   if (!rec) throw new Error(`Recommendation ${recommendationId} not found`);
   if (rec.status === "rejected") throw new Error("Cannot approve a rejected recommendation - create a new one instead");
 
-  await db.run(`UPDATE recommendations SET status = 'approved', updated_at = ${nowExpr()} WHERE id = ?`, [recommendationId]);
+  await db.run(`UPDATE recommendations SET status = 'approved', updated_at = ${nowExpr()} WHERE id = ? AND tenant_key = ?`, [recommendationId, tenantKey()]);
   await db.run(
     `UPDATE routing_policies SET rollout_pct = ?, status = ?, recommendation_id = ?, updated_at = ${nowExpr()}
-     WHERE provider = ? AND from_model = ?`,
-    [rolloutPct, statusForPct(rolloutPct), recommendationId, rec.provider, rec.current_model]
+     WHERE tenant_key = ? AND provider = ? AND from_model = ?`,
+    [rolloutPct, statusForPct(rolloutPct), recommendationId, tenantKey(), rec.provider, rec.current_model]
   );
-  await db.run(`INSERT INTO approvals (recommendation_id, action, actor, note, rollout_pct) VALUES (?, 'approve', ?, ?, ?)`, [
+  await db.run(`INSERT INTO approvals (tenant_key, recommendation_id, action, actor, note, rollout_pct) VALUES (?, ?, 'approve', ?, ?, ?)`, [
+    tenantKey(),
     recommendationId,
     actor,
     note || null,
@@ -61,15 +69,16 @@ async function approveRecommendation(recommendationId, actor, { rolloutPct = 1, 
 }
 
 async function rejectRecommendation(recommendationId, actor, { note } = {}) {
-  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ?`, [recommendationId]);
+  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ? AND tenant_key = ?`, [recommendationId, tenantKey()]);
   if (!rec) throw new Error(`Recommendation ${recommendationId} not found`);
 
-  await db.run(`UPDATE recommendations SET status = 'rejected', updated_at = ${nowExpr()} WHERE id = ?`, [recommendationId]);
+  await db.run(`UPDATE recommendations SET status = 'rejected', updated_at = ${nowExpr()} WHERE id = ? AND tenant_key = ?`, [recommendationId, tenantKey()]);
   await db.run(
-    `UPDATE routing_policies SET rollout_pct = 0, status = 'rejected', updated_at = ${nowExpr()} WHERE provider = ? AND from_model = ?`,
-    [rec.provider, rec.current_model]
+    `UPDATE routing_policies SET rollout_pct = 0, status = 'rejected', updated_at = ${nowExpr()} WHERE tenant_key = ? AND provider = ? AND from_model = ?`,
+    [tenantKey(), rec.provider, rec.current_model]
   );
-  await db.run(`INSERT INTO approvals (recommendation_id, action, actor, note, rollout_pct) VALUES (?, 'reject', ?, ?, 0)`, [
+  await db.run(`INSERT INTO approvals (tenant_key, recommendation_id, action, actor, note, rollout_pct) VALUES (?, ?, 'reject', ?, ?, 0)`, [
+    tenantKey(),
     recommendationId,
     actor,
     note || null,
@@ -78,39 +87,56 @@ async function rejectRecommendation(recommendationId, actor, { note } = {}) {
   logger.info("Recommendation rejected", { recommendationId, actor });
 }
 
-async function advanceRollout(recommendationId, actor, newPct, { note } = {}) {
+async function advanceRollout(recommendationId, actor, newPct, { note, override = false } = {}) {
   if (!ROLLOUT_LADDER.includes(newPct)) {
     throw new Error(`newPct must be one of ${ROLLOUT_LADDER.join(", ")}`);
   }
-  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ?`, [recommendationId]);
+  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ? AND tenant_key = ?`, [recommendationId, tenantKey()]);
   if (!rec) throw new Error(`Recommendation ${recommendationId} not found`);
   if (rec.status !== "approved") throw new Error(`Recommendation must be approved before its rollout can be advanced (current status: ${rec.status})`);
 
+  let overridden = false;
+  if (newPct > CANARY_MAX_PCT) {
+    const stats = await evaluation.getEvaluationStatsForPair(rec.provider, rec.current_model, rec.suggested_model);
+    const { confidence } = computeConfidence(stats);
+    const problems = [];
+    if (stats.sample_count < MIN_SAMPLES_FOR_WIDE_ROLLOUT) problems.push(`only ${stats.sample_count} evaluation sample(s), need ${MIN_SAMPLES_FOR_WIDE_ROLLOUT}`);
+    if (confidence === "shadow-tested-diverges") problems.push("shadow tests show the cheaper model diverges");
+    if (problems.length) {
+      if (!(override && note)) {
+        throw new Error(`Cannot go above ${CANARY_MAX_PCT}%: ${problems.join("; ")}. Keep gathering evidence, or pass override=true with a note explaining why.`);
+      }
+      overridden = true;
+    }
+  }
+
   await db.run(
-    `UPDATE routing_policies SET rollout_pct = ?, status = ?, updated_at = ${nowExpr()} WHERE provider = ? AND from_model = ?`,
-    [newPct, statusForPct(newPct), rec.provider, rec.current_model]
+    `UPDATE routing_policies SET rollout_pct = ?, status = ?, updated_at = ${nowExpr()} WHERE tenant_key = ? AND provider = ? AND from_model = ?`,
+    [newPct, statusForPct(newPct), tenantKey(), rec.provider, rec.current_model]
   );
-  await db.run(`INSERT INTO approvals (recommendation_id, action, actor, note, rollout_pct) VALUES (?, 'advance_rollout', ?, ?, ?)`, [
+  await db.run(`INSERT INTO approvals (tenant_key, recommendation_id, action, actor, note, rollout_pct) VALUES (?, ?, 'advance_rollout', ?, ?, ?)`, [
+    tenantKey(),
     recommendationId,
     actor,
-    note || null,
+    overridden ? `[evidence gate overridden] ${note}` : note || null,
     newPct,
   ]);
-  await logAudit(actor, "advance_rollout", `recommendation:${recommendationId}`, { newPct, note });
+  await logAudit(actor, "advance_rollout", `recommendation:${recommendationId}`, { newPct, note, overridden });
   logger.info("Rollout advanced", { recommendationId, actor, newPct });
   return getPolicyForRecommendation(rec);
 }
 
 async function rollback(recommendationId, actor, { note, automatic = false } = {}) {
-  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ?`, [recommendationId]);
+  const rec = await db.get(`SELECT * FROM recommendations WHERE id = ? AND tenant_key = ?`, [recommendationId, tenantKey()]);
   if (!rec) throw new Error(`Recommendation ${recommendationId} not found`);
 
-  await db.run(`UPDATE recommendations SET status = 'rolled_back', updated_at = ${nowExpr()} WHERE id = ?`, [recommendationId]);
+  await db.run(`UPDATE recommendations SET status = 'rolled_back', updated_at = ${nowExpr()} WHERE id = ? AND tenant_key = ?`, [recommendationId, tenantKey()]);
   await db.run(
-    `UPDATE routing_policies SET rollout_pct = 0, status = 'rolled_back', updated_at = ${nowExpr()} WHERE provider = ? AND from_model = ?`,
-    [rec.provider, rec.current_model]
+    `UPDATE routing_policies SET rollout_pct = 0, status = 'rolled_back', updated_at = ${nowExpr()} WHERE tenant_key = ? AND provider = ? AND from_model = ?`,
+    [tenantKey(), rec.provider, rec.current_model]
   );
-  await db.run(`INSERT INTO approvals (recommendation_id, action, actor, note, rollout_pct) VALUES (?, 'rollback', ?, ?, 0)`, [
+  await db.run(`INSERT INTO approvals (tenant_key, recommendation_id, action, actor, note, rollout_pct) VALUES (?, ?, 'rollback', ?, ?, 0)`, [
+    tenantKey(),
     recommendationId,
     actor,
     note || null,
@@ -127,7 +153,7 @@ async function rollback(recommendationId, actor, { note, automatic = false } = {
 // 'shadow-tested-diverges'. Intended to be called on a schedule (see
 // server/index.js) as well as on-demand via POST /api/rollout/auto-check.
 async function checkAutoRollbackConditions() {
-  const livePolicies = await db.all(`SELECT * FROM routing_policies WHERE rollout_pct > 0 AND status NOT IN ('rejected','rolled_back')`);
+  const livePolicies = await db.all(`SELECT * FROM routing_policies WHERE tenant_key = ? AND rollout_pct > 0 AND status NOT IN ('rejected','rolled_back')`, [tenantKey()]);
   const rolledBack = [];
 
   for (const policy of livePolicies) {

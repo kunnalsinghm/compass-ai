@@ -25,6 +25,7 @@ const logger = require("./logger");
 const pricing = require("./pricing");
 const evaluation = require("./evaluation");
 const { extractPromptText } = require("./semanticCache");
+const { recordOverhead } = require("./savings");
 
 async function runShadowTest({
   provider,
@@ -39,13 +40,14 @@ async function runShadowTest({
   guardApiKey,
   providerKey,
   rubric,
+  extraHeaders = {},
+  existingCaseId = null,
 }) {
-  if (requestBody?.stream) {
-    logger.info("Shadow test skipped: streaming requests are not shadow-tested in this build", { provider, primaryModel });
-    return;
-  }
-
-  const candidateBody = { ...requestBody, model: candidateModel, stream: false };
+  // A streaming primary is shadow-tested too: the proxy passes the response
+  // assembled back into non-streaming form (streaming.js), and the candidate
+  // always runs non-streaming because only its final text is compared.
+  const { stream, stream_options, ...requestRest } = requestBody || {};
+  const candidateBody = { ...requestRest, model: candidateModel, stream: false };
 
   let candidateResponseJson;
   try {
@@ -57,6 +59,12 @@ async function runShadowTest({
         "X-Provider-Key": providerKey,
         ...(team ? { "X-Team": team } : {}),
         ...(customerId ? { "X-Customer-Id": customerId } : {}),
+        // Attribution (project / cost centre / feature) so evaluation spend lands
+        // on the same owner as the traffic it tests - but never the agent/task
+        // identity (a test must not pollute cost-per-task) and always the
+        // shadow-test environment (excluded from the production baseline).
+        ...extraHeaders,
+        "X-Agent-Id": "compass-shadow-test",
         "X-Environment": "shadow-test",
       },
       body: JSON.stringify(candidateBody),
@@ -79,7 +87,14 @@ async function runShadowTest({
     output_tokens: candidateTokens.output_tokens,
   });
 
-  const caseId = await evaluation.createEvaluationCase({
+  // The candidate call is real spend caused by Compass's own testing.
+  if (candidateCost.rate_found) {
+    await recordOverhead({ provider, model: candidateModel, team, customerId, overheadUsd: candidateCost.cost_usd }).catch((err) =>
+      logger.warn("Could not record shadow-test overhead", { error: err.message })
+    );
+  }
+
+  const caseId = existingCaseId || await evaluation.createEvaluationCase({
     source: "shadow_test",
     provider,
     primaryModel,

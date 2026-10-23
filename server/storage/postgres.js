@@ -38,6 +38,7 @@ function toPositional(sql) {
 const { SCHEMA_SQL } = require("./schema.postgres");
 const ready = (async () => {
   await pool.query(`CREATE SCHEMA IF NOT EXISTS ${schemaName}`);
+  await require("./legacyMigrate").prePostgres(pool); // databases created before tenant scoping
   await pool.query(SCHEMA_SQL);
 })().catch((err) => {
   throw new Error(`Compass Postgres schema initialization failed: ${err.message}`);

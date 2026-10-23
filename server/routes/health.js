@@ -23,6 +23,12 @@ router.get("/", async (req, res) => {
     status.ok = false;
   }
 
+  if (status.guard_db === "ok") {
+    const schema = await guardDb.checkSchema();
+    status.guard_schema = schema.ok ? "ok" : schema.problems;
+    if (!schema.ok) status.ok = false;
+  }
+
   res.status(status.ok ? 200 : 503).json(status);
 });
 

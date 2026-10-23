@@ -228,6 +228,9 @@ store - Compass issues no keys of its own). Guard's bootstrap mode
 | POST | `/api/router/explain` | Dry-run classification, no side effects |
 | GET | `/api/evaluation/results`, `/api/evaluation/stats` | Evaluation evidence |
 | POST | `/api/evaluation/results/:id/label` | Attach a human label |
+| GET | `/api/evaluation/cases` | Test cases (shadow tests, feedback, imported Guard flags) |
+| POST | `/api/evaluation/sync-guard` | Import Guard's flagged test cases now (also runs on a schedule) |
+| POST | `/api/evaluation/cases/:id/replay` | Replay a case against its candidate model (needs `X-Provider-Key`) |
 | POST | `/api/feedback` | Report a production event -> permanent test case |
 | GET/POST | `/api/recommendations`, `/api/recommendations/generate` | Recommendation engine |
 | POST | `/api/rollout/:id/approve\|reject\|advance\|rollback` | Approval workflow |
@@ -247,6 +250,19 @@ headers Guard itself accepts (forwarded through unchanged). Guard's own
 headers are deliberately **not** forwarded - use Compass's `X-Compass-*`
 equivalents when routing through Compass, to avoid two independent caching
 layers disagreeing about what "cached" means.
+
+## Guard integration and multi-tenancy
+
+Compass sits in front of Guard and follows Guard's rules:
+
+- **Identity**: the team bound to the API key wins; a conflicting `X-Team` is a 403. Attribution headers (project, cost centre, feature, agent, task, region...) are forwarded to Guard.
+- **Governance before cache**: a cache hit never reaches Guard, so Compass mirrors Guard's model and region allow-lists (most-specific-wins) before serving one. Requests are PII-redacted *before* the cache key is built, so raw PII is never cached. `X-Disable-PII-Redaction: true` also disables caching and shadow tests.
+- **Cache hits are visible in Guard**: reported as zero-token events carrying a `compass` payload (disable with `COMPASS_REPORT_CACHE_HITS=false`).
+- **Streaming**: streamed responses are captured, cached, replayed as SSE, and shadow-tested.
+- **Outage failover**: only on 500/502/503/504/529 from a non-streaming call, text-only requests, and only if the caller sends `X-Compass-Fallback-Provider-Key`. Policy refusals (402/403/429) are never retried elsewhere. The fallback still goes through Guard.
+- **Multi-tenant**: with Guard on `FINOPS_MULTI_TENANT=true`, set `COMPASS_MULTI_TENANT=true` (Postgres required). Every Compass table carries `tenant_key`, the tenant context fails closed outside a request, and background jobs run once per active tenant. Give Compass a **read-only** Postgres role for Guard's database.
+- **Rollout evidence gate**: up to a 5% canary is ungated; going wider needs `COMPASS_MIN_SAMPLES_FOR_WIDE_ROLLOUT` (30) evaluation samples and no "diverges" verdict, or `override: true` plus a note (recorded in the approval log).
+- **Upgrading**: databases created before tenant scoping are migrated in place on start (`storage/legacyMigrate.js`), including de-duplicating routing policies.
 
 ## Configuration
 
@@ -286,9 +302,7 @@ run against a real fixture Guard-shaped SQLite database, not mocks of
 
 **Needs your own verification before relying on it in production:**
 
-- **Postgres backend** (`storage/postgres.js`, `guardDb.js`'s postgres
-  path) - structurally mirrors the SQLite path but has not been run
-  end-to-end here. SQLite is what was actually exercised.
+- **Postgres backend** - exercised once end to end (two Guard tenants, cache isolation, per-tenant savings and Guard events) but not under load, and the legacy-migration path is only unit-tested on SQLite.
 - **Real embedding-mode semantic caching** - the local term-frequency mode
   is what's tested; the OpenAI-embeddings path is straightforward but
   untested against a live embeddings endpoint in this environment.
@@ -302,17 +316,12 @@ run against a real fixture Guard-shaped SQLite database, not mocks of
 
 ## Known gaps (deliberately out of scope for this build)
 
-- **Streaming cache replay and streaming shadow-testing** - both
-  explicitly deferred (blueprint's own "defer" list agrees); streaming
-  requests bypass caching and shadow-testing entirely in this build,
-  though routing still applies.
 - **Learned routing** - only the interpretable classifier is built.
   Learned-router mode needs a volume of customer-specific evaluation data
   this build has no way to have accumulated yet.
-- **Automatic production-signal detection** (retry counts, latency
-  regressions) - `POST /api/feedback` requires the calling application to
-  report these explicitly; Compass does not poll Guard's usage_events and
-  guess at causality.
+- **Production-signal detection** - Guard's flagged test cases (thumbs-down, high retry, low shadow similarity) are imported; latency regressions and other signals are not inferred. `POST /api/feedback` remains for explicit reports.
+- **Evaluation depth** - no pairwise judge or trajectory/tool-call-validity checks yet.
+- **Savings baseline verification** - savings are ledgered per event; a before/after baseline-window verification is not built.
 - **Tool-call execution/sandboxing during shadow tests** - not applicable
   at this layer; Compass only re-runs the model call, never executes a
   tool on the caller's behalf (see `shadowTest.js`'s header comment).

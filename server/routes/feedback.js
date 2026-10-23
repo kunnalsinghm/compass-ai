@@ -10,6 +10,7 @@ const router = express.Router();
 const { requireAuth } = require("../auth");
 const { reportProductionEvent, VALID_TRIGGERS } = require("../tracePipeline");
 
+const { resolveTeam } = require("../identity");
 const GUARD_BASE_URL = (process.env.GUARD_BASE_URL || "http://localhost:4000").replace(/\/$/, "");
 
 router.get("/triggers", requireAuth("read"), (req, res) => {
@@ -23,6 +24,12 @@ router.post("/", requireAuth("write"), async (req, res) => {
     return res.status(400).json({ error: "trigger, provider, model, and request are required" });
   }
 
+  // Same identity rule as the proxy: a key bound to a team can't report as another.
+  const identity = resolveTeam(req.apiKey, team || req.header("X-Team"));
+  if (!identity.ok) return res.status(identity.status).json({ error: identity.error });
+  const extraHeaders = {};
+  for (const h of ["X-Project-Id", "X-Cost-Center", "X-Feature-Id"]) if (req.header(h)) extraHeaders[h] = req.header(h);
+
   try {
     const result = await reportProductionEvent({
       trigger,
@@ -31,12 +38,13 @@ router.post("/", requireAuth("write"), async (req, res) => {
       requestBody: request,
       responseJson: response || {},
       costUsd: cost_usd ?? null,
-      team: team || req.header("X-Team") || null,
+      team: identity.team,
       customerId: customer_id || req.header("X-Customer-Id") || null,
       rubric: rubric || null,
       note: note || null,
       guardBaseUrl: GUARD_BASE_URL,
       guardApiKey: req.header("X-API-Key"),
+      extraHeaders,
       providerKey: provider_key || req.header("X-Provider-Key"),
     });
     res.status(201).json(result);
