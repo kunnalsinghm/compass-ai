@@ -259,4 +259,114 @@ async function getVerifiedSavings({ days = 30, sharePct = DEFAULT_SHARE_PCT } = 
   };
 }
 
-module.exports = { recordSaving, recordOverhead, getSavingsSummary, getTieredEconomicsReport, getVerifiedSavings };
+// ---------------------------------------------------------------------
+// Baseline verification: does Guard's OWN spend data show the saving the
+// ledger claims? The ledger is Compass's bookkeeping of what it did; this
+// compares cost per request in a window before Compass started against the
+// recent window, using only Guard's usage_events (production traffic, shadow
+// tests excluded), and reports how closely the two agree.
+//
+// It is a corroboration, never a proof: prices, model mix and prompt size all
+// move for reasons that have nothing to do with Compass, so the result carries
+// an explicit status and the reasons it may be unreliable. Billing stays on the
+// ledger (getVerifiedSavings); this endpoint is the audit of that number.
+// ---------------------------------------------------------------------
+const MIN_BASELINE_REQUESTS = Number(process.env.COMPASS_MIN_BASELINE_REQUESTS) || 50;
+const MIX_DRIFT_LIMIT = 0.4; // tokens-per-request moved by more than 40%
+const AGREEMENT_TOLERANCE = 0.3; // implied vs ledger within +/-30%
+
+function windowMetrics(w) {
+  const tokens = w.input_tokens + w.output_tokens;
+  return {
+    cost_usd: round4(w.cost),
+    requests: w.requests,
+    billed_requests: w.billed_requests,
+    tokens,
+    cost_per_request_usd: w.requests ? w.cost / w.requests : null,
+    tokens_per_billed_request: w.billed_requests ? tokens / w.billed_requests : null,
+  };
+}
+
+async function getBaselineVerification({ days = 30, baselineDays = 30, compassStart, now = new Date() } = {}) {
+  const DAY = 86400000;
+  const first = await db.get(`SELECT MIN(created_at) AS first_at FROM savings_ledger WHERE tenant_key = ?`, [tenantKey()]);
+  const startRaw = compassStart || first?.first_at;
+  if (!startRaw) {
+    return { status: "no-compass-history", window_days: days, baseline_days: baselineDays, caveats: ["Compass has not recorded any savings yet, so there is no 'after' period to compare."] };
+  }
+  const startStr = startRaw instanceof Date ? startRaw.toISOString() : String(startRaw);
+  const start = new Date(startStr.endsWith("Z") || startStr.includes("T") ? startStr : startStr.replace(" ", "T") + "Z");
+  const nowMs = now.getTime();
+  const afterFrom = new Date(Math.max(start.getTime(), nowMs - days * DAY));
+  const baseTo = start;
+  const baseFrom = new Date(start.getTime() - baselineDays * DAY);
+
+  const [before, after] = await Promise.all([
+    guardDb.getSpendWindow({ from: baseFrom.toISOString(), to: baseTo.toISOString() }),
+    guardDb.getSpendWindow({ from: afterFrom.toISOString(), to: new Date(nowMs).toISOString() }),
+  ]);
+  const b = windowMetrics(before);
+  const a = windowMetrics(after);
+
+  const ledger = await db.get(
+    `SELECT COALESCE(SUM(net_savings_usd),0) AS net FROM savings_ledger WHERE tenant_key = ? AND created_at >= ?`,
+    [tenantKey(), afterFrom.toISOString().slice(0, 19).replace("T", " ")]
+  );
+  const ledgerNet = Number(ledger?.net || 0);
+
+  const out = {
+    window_days: days,
+    baseline_days: baselineDays,
+    compass_started_at: start.toISOString(),
+    baseline: { from: baseFrom.toISOString(), to: baseTo.toISOString(), ...b },
+    current: { from: afterFrom.toISOString(), to: new Date(nowMs).toISOString(), ...a },
+    ledger_net_savings_usd: round4(ledgerNet),
+    implied_savings_usd: null,
+    agreement_ratio: null,
+    status: null,
+    caveats: [],
+  };
+
+  if (b.requests < MIN_BASELINE_REQUESTS) {
+    out.status = "insufficient-baseline";
+    out.caveats.push(`Only ${b.requests} request(s) in the ${baselineDays} days before Compass started; need at least ${MIN_BASELINE_REQUESTS} for a meaningful baseline.`);
+    return out;
+  }
+  if (a.requests === 0) {
+    out.status = "no-recent-traffic";
+    out.caveats.push("No production requests in the recent window.");
+    return out;
+  }
+
+  const implied = (b.cost_per_request_usd - a.cost_per_request_usd) * a.requests;
+  out.implied_savings_usd = round4(implied);
+  out.cost_per_request_change_pct = b.cost_per_request_usd > 0 ? round1(((a.cost_per_request_usd - b.cost_per_request_usd) / b.cost_per_request_usd) * 100) : null;
+
+  if (b.tokens_per_billed_request && a.tokens_per_billed_request) {
+    const drift = Math.abs(a.tokens_per_billed_request - b.tokens_per_billed_request) / b.tokens_per_billed_request;
+    out.request_size_drift_pct = round1(drift * 100);
+    if (drift > MIX_DRIFT_LIMIT) out.caveats.push(`Average request size changed by ${round1(drift * 100)}% between the two windows, so a cost-per-request comparison may reflect a different workload rather than Compass.`);
+  }
+  if (a.requests < MIN_BASELINE_REQUESTS) out.caveats.push(`Only ${a.requests} request(s) in the recent window; the comparison is noisy.`);
+
+  if (ledgerNet <= 0 && implied <= 0) {
+    out.status = "no-saving-observed";
+  } else if (ledgerNet > 0) {
+    out.agreement_ratio = round3(implied / ledgerNet);
+    const close = Math.abs(out.agreement_ratio - 1) <= AGREEMENT_TOLERANCE;
+    if (out.caveats.some((c) => c.startsWith("Average request size"))) out.status = "inconclusive";
+    else if (close) out.status = "corroborated";
+    else if (implied < ledgerNet) out.status = "ledger-exceeds-observed";
+    else out.status = "observed-exceeds-ledger";
+  } else {
+    out.status = "observed-without-ledger";
+    out.caveats.push("Guard's spend fell but the ledger has no matching savings; the drop is not attributable to Compass.");
+  }
+  out.caveats.push("Corroboration only: prices, model mix and workload also change cost per request. Fees are computed from the ledger, not from this comparison.");
+  return out;
+}
+
+function round1(n) { return Math.round(Number(n) * 10) / 10; }
+function round3(n) { return Math.round(Number(n) * 1000) / 1000; }
+
+module.exports = { recordSaving, recordOverhead, getSavingsSummary, getTieredEconomicsReport, getVerifiedSavings, getBaselineVerification };

@@ -236,6 +236,8 @@ store - Compass issues no keys of its own). Guard's bootstrap mode
 | POST | `/api/rollout/:id/approve\|reject\|advance\|rollback` | Approval workflow |
 | POST | `/api/rollout/auto-check` | Manually trigger the auto-rollback sweep |
 | GET | `/api/savings/summary`, `/api/savings/tiered-economics` | Savings ledger + report |
+| GET | `/api/savings/verified` | Overhead-adjusted realized savings and the fee they support |
+| GET | `/api/savings/baseline` | Audit of the ledger against Guard's own before/after spend (corroboration, never billing) |
 | GET | `/api/audit` | Audit log |
 | GET | `/api/health` | Compass DB + Guard connectivity |
 
@@ -263,6 +265,13 @@ Compass sits in front of Guard and follows Guard's rules:
 - **Multi-tenant**: with Guard on `FINOPS_MULTI_TENANT=true`, set `COMPASS_MULTI_TENANT=true` (Postgres required). Every Compass table carries `tenant_key`, the tenant context fails closed outside a request, and background jobs run once per active tenant. Give Compass a **read-only** Postgres role for Guard's database.
 - **Rollout evidence gate**: up to a 5% canary is ungated; going wider needs `COMPASS_MIN_SAMPLES_FOR_WIDE_ROLLOUT` (30) evaluation samples and no "diverges" verdict, or `override: true` plus a note (recorded in the approval log).
 - **Upgrading**: databases created before tenant scoping are migrated in place on start (`storage/legacyMigrate.js`), including de-duplicating routing policies.
+
+## Verifying it on real traffic
+
+The automated tests use a mock provider. Before relying on Compass, run the capped trial in
+[docs/real-traffic-trial.md](docs/real-traffic-trial.md) (`scripts/real-traffic-trial.js`): it sends real requests through
+cache, routing and shadow tests and reports pass/fail. The dashboard's **Savings Verification** panel then compares the ledger
+with Guard's own spend before and after Compass started; it says "inconclusive" when the workload changed rather than guess.
 
 ## Configuration
 

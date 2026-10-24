@@ -108,6 +108,9 @@ test("end-to-end: generate -> approve -> advance -> rollback", async () => {
   assert.equal(rec.status, "pending");
   assert.equal(rec.confidence, "cost-only"); // no evaluation evidence seeded yet
   assert.equal(rec.rollout_pct, 0);
+  assert.equal(rec.evidence_gate.ok, false); // no samples yet
+  assert.equal(rec.evidence_gate.samples, 0);
+  assert.equal(rec.evidence_gate.needed, recommend.MIN_SAMPLES_FOR_WIDE_ROLLOUT);
 
   const policy = await rollout.approveRecommendation(rec.id, "test-actor", { rolloutPct: 1, note: "canary it" });
   assert.equal(policy.rollout_pct, 1);
@@ -144,8 +147,10 @@ test("cannot advance rollout on a recommendation that was never approved", async
 test("auto-rollback fires when fresh evidence turns diverging", async () => {
   const created = await recommend.generateRecommendations({ days: 30 });
   const recs = await recommend.listRecommendations({});
-  const rec = recs.find((r) => r.current_model === "gpt-4o" && r.status !== "rolled_back");
-  if (!rec) return;
+  let rec = recs.find((r) => r.current_model === "gpt-4o");
+  assert.ok(rec, "a gpt-4o recommendation must exist for this test to mean anything");
+  // The earlier end-to-end test rolled this one back; put it back to a fresh pending state.
+  await require("../server/storage").run(`UPDATE recommendations SET status = 'pending' WHERE id = ?`, [rec.id]);
 
   await rollout.approveRecommendation(rec.id, "test-actor", { rolloutPct: 25 });
 
