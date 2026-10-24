@@ -106,7 +106,10 @@ async function bestEffort(provider, what, fn) {
   }
 }
 
-router.post("/:provider", requireAuth("write"), async (req, res) => {
+// The stock OpenAI and Anthropic SDKs append their own path to a baseURL
+// (/chat/completions and /v1/messages), so those are accepted as aliases of the
+// bare endpoint: set baseURL to .../api/proxy/openai (or /anthropic) and go.
+router.post(["/:provider", "/:provider/chat/completions", "/:provider/v1/messages"], requireAuth("write"), async (req, res) => {
   const provider = String(req.params.provider || "").toLowerCase();
   if (!SUPPORTED_PROVIDERS.includes(provider)) {
     return res.status(400).json({ error: `Unsupported provider '${provider}'. Supported: ${SUPPORTED_PROVIDERS.join(", ")}` });
