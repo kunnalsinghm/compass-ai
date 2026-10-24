@@ -8,6 +8,7 @@
 
 const db = require("../storage");
 const { tenantKey } = require("../tenantContext");
+const { redactValue } = require("../piiRedaction");
 const { runDeterministicChecks, extractText } = require("./deterministic");
 const { judgeResponses } = require("./llmJudge");
 const { tokenize, termFrequency, cosineSimilarityLocal } = require("../semanticCache");
@@ -17,6 +18,10 @@ function lexicalSimilarity(textA, textB) {
 }
 
 async function createEvaluationCase({ source, provider, primaryModel, candidateModel, inputJson, rubric, team, baselineResponse = null, triggerSource = null, guardFlagId = null }) {
+  // A test case is a permanent copy of real traffic, so PII is removed at the
+  // door whatever the source (shadow test, feedback report, imported flag).
+  inputJson = redactValue(inputJson === undefined ? null : inputJson).value;
+  if (typeof baselineResponse === "string") baselineResponse = redactValue(baselineResponse).value;
   const result = await db.run(
     `INSERT INTO evaluation_cases (tenant_key, source, provider, primary_model, candidate_model, input_json, rubric, team, baseline_response, trigger_source, guard_flag_id)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
