@@ -24,7 +24,10 @@ async function api(path, opts = {}) {
 
 function fmtUsd(n) {
   if (n === null || n === undefined || Number.isNaN(Number(n))) return "—";
-  return `$${Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const v = Number(n);
+  // Sub-cent amounts are real (cache hits on cheap models); showing them as $0.00 hides the signal.
+  const digits = v !== 0 && Math.abs(v) < 0.01 ? 4 : 2;
+  return `$${v.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 function fmtPct(n) {
   if (n === null || n === undefined) return "—";
@@ -86,8 +89,9 @@ async function loadHealth() {
 
 // ---- Summary cards --------------------------------------------------------
 async function loadSummaryCards() {
-  const [savings, cacheStats, semanticStats, recs] = await Promise.all([
+  const [savings, verified, cacheStats, semanticStats, recs] = await Promise.all([
     api("/api/savings/summary?days=30").catch(() => null),
+    api("/api/savings/verified?days=30").catch(() => null),
     api("/api/cache/stats").catch(() => null),
     api("/api/semantic-cache/stats").catch(() => null),
     api("/api/recommendations").catch(() => []),
@@ -96,7 +100,8 @@ async function loadSummaryCards() {
 
   const cards = [
     { label: "Net savings (30d)", value: savings ? fmtUsd(savings.total_net_savings_usd) : "—", live: true },
-    { label: "Cache hit rate", value: cacheStats && cacheStats.total_hits + (semanticStats?.total_hits || 0) > 0 ? String(cacheStats.total_hits + (semanticStats?.total_hits || 0)) + " hits" : "0 hits" },
+    { label: "Verified savings (30d)", value: verified ? fmtUsd(verified.verified_net_savings_usd) : "—" },
+    { label: "Cache hits", value: `${(cacheStats?.total_hits || 0) + (semanticStats?.total_hits || 0)}` },
     { label: "Recommendations", value: String(recs.length) },
     { label: "Live rollouts", value: String(liveRollouts) },
   ];
@@ -106,6 +111,55 @@ async function loadSummaryCards() {
       (c) => `<div class="card${c.live ? " live" : ""}"><div class="label">${esc(c.label)}</div><div class="value">${esc(c.value)}</div></div>`
     )
     .join("");
+}
+
+// ---- Savings verification ---------------------------------------------------
+const BASELINE_STATUS = {
+  corroborated: { badge: "badge-good", text: "Guard's spend data agrees with the ledger" },
+  "ledger-exceeds-observed": { badge: "badge-danger", text: "Ledger claims more than Guard's spend shows" },
+  "observed-exceeds-ledger": { badge: "badge-signal", text: "Guard's spend fell more than the ledger explains" },
+  "observed-without-ledger": { badge: "badge-muted", text: "Spend fell, not attributable to Compass" },
+  inconclusive: { badge: "badge-muted", text: "Workload changed - inconclusive" },
+  "insufficient-baseline": { badge: "badge-muted", text: "Not enough pre-Compass history" },
+  "no-recent-traffic": { badge: "badge-muted", text: "No recent traffic" },
+  "no-saving-observed": { badge: "badge-muted", text: "No saving observed yet" },
+  "no-compass-history": { badge: "badge-muted", text: "No Compass activity yet" },
+};
+
+function stat(label, value, color) {
+  return `<div><div style="color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">${esc(label)}</div><div style="font-family:var(--font-data);font-size:18px;font-weight:600;margin-top:4px;${color ? `color:${color};` : ""}">${esc(value)}</div></div>`;
+}
+
+async function loadSavingsVerification() {
+  const box = document.getElementById("verifiedSavings");
+  const detail = document.getElementById("baselineDetail");
+  try {
+    const [v, b] = await Promise.all([api("/api/savings/verified?days=30"), api("/api/savings/baseline?days=30")]);
+    box.innerHTML = [
+      stat("Verified net savings", fmtUsd(v.verified_net_savings_usd), "var(--good)"),
+      stat("Gross savings", fmtUsd(v.gross_savings_usd)),
+      stat("Optimization overhead", fmtUsd(v.overhead_usd)),
+      stat(`Fee at ${v.share_pct}%`, fmtUsd(v.fee_usd)),
+      stat("Unrealized estimates", fmtUsd(v.unrealized_estimate_usd)),
+    ].join("");
+    const meta = BASELINE_STATUS[b.status] || { badge: "badge-muted", text: b.status };
+    document.getElementById("baselineBadge").innerHTML = `<span class="badge ${meta.badge}">${esc(b.status)}</span>`;
+    let html = `<div style="font-size:13px;margin-bottom:8px;">${esc(meta.text)}.</div>`;
+    if (b.baseline && b.current) {
+      const perReq = (w) => (w.cost_per_request_usd === null || w.cost_per_request_usd === undefined ? "—" : `$${Number(w.cost_per_request_usd).toFixed(5)}`);
+      html += `<table><thead><tr><th>Window</th><th>Requests</th><th>Cost</th><th>Cost / request</th></tr></thead><tbody>
+        <tr><td>Before Compass (${b.baseline_days}d)</td><td>${b.baseline.requests}</td><td>${fmtUsd(b.baseline.cost_usd)}</td><td>${perReq(b.baseline)}</td></tr>
+        <tr><td>Recent (${b.window_days}d)</td><td>${b.current.requests}</td><td>${fmtUsd(b.current.cost_usd)}</td><td>${perReq(b.current)}</td></tr></tbody></table>`;
+      if (b.implied_savings_usd !== null) {
+        html += `<div style="font-size:12px;color:var(--text-muted);margin-top:8px;">Implied by Guard's data: <b>${fmtUsd(b.implied_savings_usd)}</b> &middot; Ledger: <b>${fmtUsd(b.ledger_net_savings_usd)}</b>${b.agreement_ratio !== null ? ` &middot; Agreement: <b>${b.agreement_ratio > 10 ? "&gt;1000%" : (b.agreement_ratio * 100).toFixed(0) + "%"}</b>` : ""}</div>`;
+      }
+    }
+    html += (b.caveats || []).map((c) => `<div style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">&bull; ${esc(c)}</div>`).join("");
+    detail.innerHTML = html;
+  } catch (err) {
+    box.innerHTML = `<div style="color:var(--danger);">${esc(err.message)}</div>`;
+    detail.innerHTML = "";
+  }
 }
 
 // ---- Tiered economics -----------------------------------------------------
@@ -182,6 +236,7 @@ function renderRecCard(r) {
         <div class="rec-stat"><div class="label" style="color:var(--text-muted);text-transform:uppercase;font-size:10px;">Est. savings</div><div class="value" style="font-family:var(--font-data);color:var(--good);">${fmtUsd(r.estimated_savings_usd)} (${fmtPct(r.estimated_savings_pct)})</div></div>
         <div class="rec-stat"><div class="label" style="color:var(--text-muted);text-transform:uppercase;font-size:10px;">Affected requests</div><div class="value" style="font-family:var(--font-data);">${r.affected_events ?? "—"}</div></div>
       </div>
+      ${renderGate(r)}
       <div class="progress-track"><div class="progress-fill" style="width:${r.rollout_pct}%;"></div></div>
       <div class="btn-row">
         <button class="primary approve-btn" ${r.status === "approved" ? "disabled" : ""}>Approve (1%)</button>
@@ -189,6 +244,17 @@ function renderRecCard(r) {
         <button class="danger reject-btn" ${r.status === "rejected" ? "disabled" : ""}>Reject</button>
         <button class="danger rollback-btn" ${r.rollout_pct === 0 ? "disabled" : ""}>Rollback</button>
       </div>
+    </div>`;
+}
+
+// Evidence needed before the rollout can go wider than the canary.
+function renderGate(r) {
+  const g = r.evidence_gate;
+  if (!g) return "";
+  const pct = Math.min(100, Math.round((g.samples / g.needed) * 100));
+  const color = g.ok ? "var(--good)" : "var(--text-muted)";
+  return `<div style="font-size:11.5px;color:${color};margin:8px 0 4px;">
+      Evidence for rollouts above ${g.canary_max_pct}%: ${g.samples}/${g.needed} samples (${pct}%) &middot; ${g.ok ? "ready" : esc(g.problems.join("; "))}
     </div>`;
 }
 
@@ -210,7 +276,16 @@ function wireRecCard(r) {
       await api(`/api/rollout/${r.id}/advance`, { method: "POST", body: JSON.stringify({ rollout_pct: next }) });
       loadRecommendations();
     } catch (err) {
-      alert(err.message);
+      // The evidence gate refused. A human can override, but must say why - it is recorded.
+      if (!/Cannot go above/.test(err.message)) return alert(err.message);
+      const note = prompt(`${err.message}\n\nTo override, explain why (this is recorded in the audit log). Leave empty to cancel.`);
+      if (!note) return;
+      try {
+        await api(`/api/rollout/${r.id}/advance`, { method: "POST", body: JSON.stringify({ rollout_pct: next, override: true, note }) });
+        loadRecommendations();
+      } catch (err2) {
+        alert(err2.message);
+      }
     }
   };
   card.querySelector(".reject-btn").onclick = async () => {
@@ -297,6 +372,34 @@ async function loadRoutingTable() {
   }
 }
 
+// ---- Evaluation cases (shadow tests, feedback, imported Guard flags) ------------
+const CASE_SOURCE_BADGE = { shadow_test: "badge-muted", feedback: "badge-signal", guard_flag: "badge-danger", manual: "badge-muted" };
+
+async function loadEvaluationCases() {
+  const body = document.querySelector("#caseTable tbody");
+  try {
+    const rows = await api("/api/evaluation/cases?limit=25");
+    const list = Array.isArray(rows) ? rows : rows.cases || [];
+    const guardCount = list.filter((c) => c.trigger_source || c.guard_flag_id).length;
+    document.getElementById("caseSummary").textContent = `${list.length} shown${guardCount ? ` · ${guardCount} flagged in production` : ""}`;
+    body.innerHTML =
+      list
+        .map((c) => `<tr><td><span class="badge ${CASE_SOURCE_BADGE[c.source] || "badge-muted"}">${esc(c.trigger_source || c.source)}</span></td><td>${esc(c.provider)}/${esc(c.primary_model)}&rarr;${esc(c.candidate_model)}</td><td>${esc(c.team || "—")}</td><td style="font-size:11px;">${timeAgo(c.created_at)}</td></tr>`)
+        .join("") || `<tr><td colspan="4" style="color:var(--text-faint);">No cases yet - they appear as shadow tests run and as Guard flags production problems.</td></tr>`;
+  } catch (err) {
+    body.innerHTML = `<tr><td colspan="4" style="color:var(--danger);">${esc(err.message)}</td></tr>`;
+  }
+}
+document.getElementById("syncGuardBtn").onclick = async () => {
+  try {
+    const r = await api("/api/evaluation/sync-guard", { method: "POST", body: JSON.stringify({}) });
+    alert(`Imported ${r.imported ?? 0} flagged case(s) from Guard.`);
+    loadEvaluationCases();
+  } catch (err) {
+    alert(err.message);
+  }
+};
+
 // ---- Evaluation results ----------------------------------------------------
 async function loadEvaluationTable() {
   try {
@@ -333,7 +436,7 @@ async function loadAuditLog() {
 // ---- Orchestration ---------------------------------------------------------
 async function loadAll() {
   await loadHealth();
-  await Promise.all([loadSummaryCards(), loadTieredEconomics(), loadSavingsChart(), loadRecommendations(), loadCachePanels(), loadRoutingTable(), loadEvaluationTable(), loadAuditLog()]);
+  await Promise.all([loadSummaryCards(), loadSavingsVerification(), loadTieredEconomics(), loadSavingsChart(), loadRecommendations(), loadCachePanels(), loadRoutingTable(), loadEvaluationCases(), loadEvaluationTable(), loadAuditLog()]);
 }
 
 loadAll();

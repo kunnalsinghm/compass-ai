@@ -42,6 +42,13 @@
 
   <div class="cards" id="summaryCards"></div>
 
+  <div class="panel stagger-in" style="animation-delay:0.04s;">
+    <h2 class="panel-title">Savings Verification <span id="baselineBadge"></span></h2>
+    <div class="tick-rule"></div>
+    <div id="verifiedSavings" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;"></div>
+    <div id="baselineDetail" style="margin-top:14px;"></div>
+  </div>
+
   <div class="grid stagger-in" style="animation-delay:0.06s;">
     <div class="panel">
       <h2 class="panel-title">Tiered Economics <span style="font-weight:400;text-transform:none;letter-spacing:0;">same traffic, three policies</span></h2>
@@ -73,7 +80,7 @@
       <h2 class="panel-title">Exact-Match Cache</h2>
       <div class="tick-rule"></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-        <div><div class="card .label" style="color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Entries</div><div id="cacheEntries" style="font-family:var(--font-data);font-size:20px;font-weight:600;margin-top:4px;">—</div></div>
+        <div><div style="color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Entries</div><div id="cacheEntries" style="font-family:var(--font-data);font-size:20px;font-weight:600;margin-top:4px;">—</div></div>
         <div><div style="color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Hits</div><div id="cacheHits" style="font-family:var(--font-data);font-size:20px;font-weight:600;margin-top:4px;">—</div></div>
       </div>
       <div class="btn-row"><button id="clearCacheBtn" class="danger">Clear cache</button></div>
@@ -103,6 +110,18 @@
       <div class="tick-rule"></div>
       <div id="auditLog"></div>
     </div>
+  </div>
+
+  <div class="panel stagger-in" style="animation-delay:0.20s;">
+    <h2 class="panel-title">Evaluation Cases <span id="caseSummary" style="font-weight:400;text-transform:none;letter-spacing:0;"></span></h2>
+    <div class="tick-rule"></div>
+    <div class="btn-row" style="margin-top:0;margin-bottom:12px;">
+      <button id="syncGuardBtn" class="secondary">Import flagged cases from Guard</button>
+    </div>
+    <table id="caseTable">
+      <thead><tr><th>Source</th><th>Pair</th><th>Team</th><th>Created</th></tr></thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <div class="panel stagger-in" style="animation-delay:0.22s;">

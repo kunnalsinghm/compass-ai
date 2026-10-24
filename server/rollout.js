@@ -16,18 +16,13 @@
 
 const db = require("./storage");
 const { logAudit } = require("./audit");
-const { computeConfidence } = require("./recommend");
+const { computeConfidence, evidenceGate, CANARY_MAX_PCT } = require("./recommend");
 const evaluation = require("./evaluation");
 const logger = require("./logger");
 const { tenantKey } = require("./tenantContext");
 
 const ROLLOUT_LADDER = [0, 1, 5, 25, 50, 100];
 
-// Canary (<= CANARY_MAX_PCT) is how evidence gets gathered, so it is ungated.
-// Going wider needs real evidence: a handful of shadow samples is not enough to
-// put a cheaper model in front of production traffic (blueprint 3.9/3.10).
-const CANARY_MAX_PCT = 5;
-const MIN_SAMPLES_FOR_WIDE_ROLLOUT = Number(process.env.COMPASS_MIN_SAMPLES_FOR_WIDE_ROLLOUT) || 30;
 
 function statusForPct(pct) {
   if (pct <= 0) return "shadow";
@@ -97,11 +92,8 @@ async function advanceRollout(recommendationId, actor, newPct, { note, override 
 
   let overridden = false;
   if (newPct > CANARY_MAX_PCT) {
-    const stats = await evaluation.getEvaluationStatsForPair(rec.provider, rec.current_model, rec.suggested_model);
-    const { confidence } = computeConfidence(stats);
-    const problems = [];
-    if (stats.sample_count < MIN_SAMPLES_FOR_WIDE_ROLLOUT) problems.push(`only ${stats.sample_count} evaluation sample(s), need ${MIN_SAMPLES_FOR_WIDE_ROLLOUT}`);
-    if (confidence === "shadow-tested-diverges") problems.push("shadow tests show the cheaper model diverges");
+    const gate = evidenceGate(await evaluation.getEvaluationStatsForPair(rec.provider, rec.current_model, rec.suggested_model));
+    const problems = gate.problems;
     if (problems.length) {
       if (!(override && note)) {
         throw new Error(`Cannot go above ${CANARY_MAX_PCT}%: ${problems.join("; ")}. Keep gathering evidence, or pass override=true with a note explaining why.`);

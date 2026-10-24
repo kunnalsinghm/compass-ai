@@ -185,6 +185,32 @@ async function getSpendByModelAndTeam({ days = 30 } = {}) {
   );
 }
 
+// Production spend between two instants (ISO strings; from inclusive, to
+// exclusive). `requests` counts every event, including the zero-token events
+// Compass reports for cache hits, so cost-per-request reflects what a caller
+// actually paid per call. `billed_requests` counts only events that reached a
+// provider (tokens > 0). Shadow-test traffic is excluded: it is Compass's own
+// testing spend, not the customer's workload.
+async function getSpendWindow({ from, to }) {
+  const row = await impl.get(
+    `SELECT COALESCE(SUM(cost_usd), 0) AS cost,
+            COALESCE(SUM(input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(output_tokens), 0) AS output_tokens,
+            COUNT(*) AS requests,
+            COALESCE(SUM(CASE WHEN COALESCE(input_tokens,0) + COALESCE(output_tokens,0) > 0 THEN 1 ELSE 0 END), 0) AS billed_requests
+     FROM ${T("usage_events")}
+     WHERE event_time >= ? AND event_time < ? AND ${PRODUCTION_ONLY}`,
+    [from, to]
+  );
+  return {
+    cost: Number(row?.cost || 0),
+    input_tokens: Number(row?.input_tokens || 0),
+    output_tokens: Number(row?.output_tokens || 0),
+    requests: Number(row?.requests || 0),
+    billed_requests: Number(row?.billed_requests || 0),
+  };
+}
+
 // This calendar month's production spend for one team - what Guard's own
 // budget circuit breaker compares against the team's monthly limit.
 async function getTeamMonthSpend(team) {
@@ -338,6 +364,7 @@ module.exports = {
   getSpendByModel,
   getSpendByModelAndTeam,
   getTeamMonthSpend,
+  getSpendWindow,
   getPricingOverrides,
   findApiKey,
   countKeysAndUsers,

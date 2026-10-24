@@ -32,6 +32,22 @@ const MIN_TRAFFIC_EVENTS = Number(process.env.COMPASS_MIN_TRAFFIC_EVENTS) || 20;
 const MIN_SAMPLES_FOR_CONFIDENCE = Number(process.env.COMPASS_MIN_EVAL_SAMPLES) || 5;
 const SIMILARITY_THRESHOLD = Number(process.env.COMPASS_SIMILARITY_THRESHOLD) || 0.85;
 const DETERMINISTIC_PASS_THRESHOLD = Number(process.env.COMPASS_DETERMINISTIC_PASS_THRESHOLD) || 0.9;
+// Canary (<= CANARY_MAX_PCT) is how evidence gets gathered, so it is ungated.
+// Going wider needs real evidence: a handful of shadow samples is not enough
+// to put a cheaper model in front of production traffic (blueprint 3.9/3.10).
+const CANARY_MAX_PCT = 5;
+const MIN_SAMPLES_FOR_WIDE_ROLLOUT = Number(process.env.COMPASS_MIN_SAMPLES_FOR_WIDE_ROLLOUT) || 30;
+
+// What stands between this recommendation and a rollout wider than the canary.
+function evidenceGate(evalStats) {
+  const stats = evalStats || { sample_count: 0 };
+  const { confidence } = computeConfidence(stats);
+  const problems = [];
+  if ((stats.sample_count || 0) < MIN_SAMPLES_FOR_WIDE_ROLLOUT) problems.push(`only ${stats.sample_count || 0} evaluation sample(s), need ${MIN_SAMPLES_FOR_WIDE_ROLLOUT}`);
+  if (confidence === "shadow-tested-diverges") problems.push("shadow tests show the cheaper model diverges");
+  return { ok: problems.length === 0, samples: stats.sample_count || 0, needed: MIN_SAMPLES_FOR_WIDE_ROLLOUT, canary_max_pct: CANARY_MAX_PCT, problems };
+}
+
 const MIN_HUMAN_REVIEW = Number(process.env.COMPASS_MIN_HUMAN_REVIEW) || 3;
 
 function computeConfidence(evalStats) {
@@ -166,6 +182,11 @@ async function generateRecommendations({ days = 30 } = {}) {
   return created;
 }
 
+// Evidence moves after a recommendation is generated, so the gate is read live.
+async function liveEvidenceGate(rec) {
+  return evidenceGate(await evaluation.getEvaluationStatsForPair(rec.provider, rec.current_model, rec.suggested_model));
+}
+
 async function listRecommendations({ status } = {}) {
   const recs = status
     ? await db.all(`SELECT * FROM recommendations WHERE tenant_key = ? AND status = ? ORDER BY estimated_savings_usd DESC NULLS LAST`, [tenantKey(), status])
@@ -177,6 +198,7 @@ async function listRecommendations({ status } = {}) {
     enriched.push({
       ...rec,
       evidence: rec.evidence_json ? JSON.parse(rec.evidence_json) : null,
+      evidence_gate: await liveEvidenceGate(rec),
       rollout_pct: policy?.rollout_pct ?? 0,
       rollout_label: rolloutLabelFor(policy),
       routing_policy_id: policy?.id ?? null,
@@ -192,6 +214,7 @@ async function getRecommendation(id) {
   return {
     ...rec,
     evidence: rec.evidence_json ? JSON.parse(rec.evidence_json) : null,
+    evidence_gate: await liveEvidenceGate(rec),
     rollout_pct: policy?.rollout_pct ?? 0,
     rollout_label: rolloutLabelFor(policy),
     routing_policy_id: policy?.id ?? null,
@@ -206,4 +229,7 @@ module.exports = {
   rolloutLabelFor,
   MIN_TRAFFIC_EVENTS,
   MIN_SAMPLES_FOR_CONFIDENCE,
+  MIN_SAMPLES_FOR_WIDE_ROLLOUT,
+  CANARY_MAX_PCT,
+  evidenceGate,
 };
