@@ -93,7 +93,23 @@ function sendCached({ res, provider, isStreaming, responseJson, headers }) {
   return res.status(200).json(responseJson);
 }
 
-router.post("/:provider", requireAuth("write"), async (req, res) => {
+// Compass's own storage (cache, routing policies, ledger) is an optimization
+// layer, not a gate: when it fails, the request must behave as if that feature
+// were off - never cost the caller an answer. (Guard's policy checks are NOT
+// best-effort: if those cannot be read, the request fails closed.)
+async function bestEffort(provider, what, fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    logger.error(`Compass could not ${what}; continuing without it`, { error: err.message, provider });
+    return undefined;
+  }
+}
+
+// The stock OpenAI and Anthropic SDKs append their own path to a baseURL
+// (/chat/completions and /v1/messages), so those are accepted as aliases of the
+// bare endpoint: set baseURL to .../api/proxy/openai (or /anthropic) and go.
+router.post(["/:provider", "/:provider/chat/completions", "/:provider/v1/messages"], requireAuth("write"), async (req, res) => {
   const provider = String(req.params.provider || "").toLowerCase();
   if (!SUPPORTED_PROVIDERS.includes(provider)) {
     return res.status(400).json({ error: `Unsupported provider '${provider}'. Supported: ${SUPPORTED_PROVIDERS.join(", ")}` });
@@ -150,14 +166,14 @@ router.post("/:provider", requireAuth("write"), async (req, res) => {
     let cacheKey = null;
     if (cacheEnabled) {
       cacheKey = cache.makeCacheKey({ provider, model: requestedModel, body, team, customerId });
-      const hit = await cache.getCached(cacheKey);
+      const hit = await bestEffort(provider, "read the exact cache", () => cache.getCached(cacheKey));
       if (hit) {
         guardClient.reportCacheHit({ req, provider, model: requestedModel, team, cacheType: "exact", wouldHaveCostUsd: hit.costPerHitUsd });
         return sendCached({ res, provider, isStreaming, responseJson: hit.responseJson, headers: hitHeaders({ type: "exact", requestedModel }) });
       }
     }
     if (semanticEnabled) {
-      const hit = await semanticCache.findSemanticMatch({ provider, model: requestedModel, team, customerId, body });
+      const hit = await bestEffort(provider, "read the semantic cache", () => semanticCache.findSemanticMatch({ provider, model: requestedModel, team, customerId, body }));
       if (hit) {
         guardClient.reportCacheHit({ req, provider, model: requestedModel, team, cacheType: "semantic", wouldHaveCostUsd: hit.costPerHitUsd, similarity: hit.similarity });
         return sendCached({ res, provider, isStreaming, responseJson: hit.responseJson, headers: hitHeaders({ type: "semantic", requestedModel, similarity: hit.similarity }) });
@@ -168,8 +184,8 @@ router.post("/:provider", requireAuth("write"), async (req, res) => {
     let effectiveModel = requestedModel;
     let routeResult = null;
     if (routingEnabled) {
-      routeResult = await compassRouter.decideRoute({ provider, requestedModel, body, team, customerId, apiKeyId: keyId, costQualityDial: dial });
-      effectiveModel = routeResult.effectiveModel;
+      routeResult = await bestEffort(provider, "decide a route", () => compassRouter.decideRoute({ provider, requestedModel, body, team, customerId, apiKeyId: keyId, costQualityDial: dial })) || null;
+      if (routeResult) effectiveModel = routeResult.effectiveModel;
     }
 
     // --- Step 4: forward to Guard ---------------------------------------------
@@ -298,23 +314,30 @@ router.post("/:provider", requireAuth("write"), async (req, res) => {
 
       const cacheable = isCacheableResponse(provider, json);
       if (cacheEnabled && cacheKey && cacheable) {
-        await cache.setCached({ cacheKey, provider, model: effectiveModel, team, customerId, responseJson: json, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens, costUsd: costUsd || 0, ttlSeconds });
+        await bestEffort(provider, "store the exact-cache entry", () =>
+          cache.setCached({ cacheKey, provider, model: effectiveModel, team, customerId, responseJson: json, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens, costUsd: costUsd || 0, ttlSeconds })
+        );
       }
       if (semanticEnabled && cacheable) {
-        await semanticCache.setSemanticCache({ provider, model: requestedModel, team, customerId, body, responseJson: json, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens, costUsd: costUsd || 0, ttlSeconds });
+        await bestEffort(provider, "store the semantic-cache entry", () =>
+          semanticCache.setSemanticCache({ provider, model: requestedModel, team, customerId, body, responseJson: json, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens, costUsd: costUsd || 0, ttlSeconds })
+        );
       }
 
       // Credit Compass only for model switches Compass itself made: if Guard's
       // circuit breaker degraded the model, that saving is Guard's.
       let savingsUsd = 0;
       if (routingEnabled && effectiveModel !== requestedModel && !degradedByGuard && costUsd !== null) {
-        const atRequested = await pricing.computeCost({ provider, model: requestedModel, ...usage });
-        if (atRequested.rate_found) {
-          savingsUsd = Math.round((atRequested.cost_usd - costUsd) * 1e6) / 1e6;
-          if (savingsUsd > 0) {
-            await recordSaving({ kind: "routing_switch", provider, model: effectiveModel, team, customerId, grossSavingsUsd: savingsUsd, overheadUsd: 0, referenceId: routeResult?.policyId || null });
+        await bestEffort(provider, "record the routing saving", async () => {
+          const atRequested = await pricing.computeCost({ provider, model: requestedModel, ...usage });
+          if (atRequested.rate_found) {
+            const saved = Math.round((atRequested.cost_usd - costUsd) * 1e6) / 1e6;
+            if (saved > 0) {
+              await recordSaving({ kind: "routing_switch", provider, model: effectiveModel, team, customerId, grossSavingsUsd: saved, overheadUsd: 0, referenceId: routeResult?.policyId || null });
+              savingsUsd = saved; // reported only once it is in the ledger
+            }
           }
-        }
+        });
       }
 
       let shadowTestStatus = "skipped";

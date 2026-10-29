@@ -116,3 +116,22 @@ nodeTest("legacy (pre-tenant) database is migrated without losing rows or duplic
   legacy.preSqlite(db); db.exec(SCHEMA_SQL); legacy.postSqlite(db);
   assert.equal(db.prepare("SELECT COUNT(*) n FROM routing_policies").get().n, 1);
 });
+
+test("evaluation cases are stored with PII redacted, whatever the source", async () => {
+  const evaluation = require("../server/evaluation");
+  const db = require("../server/storage");
+  const id = await evaluation.createEvaluationCase({
+    source: "feedback",
+    provider: "openai",
+    primaryModel: "gpt-4o",
+    candidateModel: "gpt-4o-mini",
+    inputJson: { messages: [{ role: "user", content: "Email jane.doe@example.com about card 4111 1111 1111 1111" }] },
+    baselineResponse: "Sure, I will write to jane.doe@example.com",
+    team: "t",
+  });
+  const row = await db.get(`SELECT input_json, baseline_response FROM evaluation_cases WHERE id = ?`, [id]);
+  assert.ok(!row.input_json.includes("jane.doe"), row.input_json);
+  assert.ok(!row.input_json.includes("4111"), row.input_json);
+  assert.ok(!row.baseline_response.includes("jane.doe"), row.baseline_response);
+  assert.match(row.input_json, /REDACTED/);
+});

@@ -17,8 +17,7 @@
 //     messages: [{ role: 'user', content: 'hello' }],
 //   }, { cache: true, routing: true, costQualityDial: 6 });
 //
-//   // Streaming (cache/shadow-testing are skipped for streaming in this
-//   // build - see server/routes/proxy.js - but routing still applies):
+//   // Streaming (cached, replayed and shadow-tested like any other call):
 //   for await (const chunk of client.chatStream('openai', body, { routing: true })) {
 //     process.stdout.write(chunk);
 //   }
